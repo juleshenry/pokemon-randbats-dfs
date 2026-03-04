@@ -104,7 +104,8 @@ export function getEffectiveSpeed(mon: MonState, field: FieldState): number {
 	if (mon.abilityId === 'protosynthesis') {
 		const inSun = field.weather === 'SunnyDay' || field.weather === 'Desolate Land';
 		const hasBooster = mon.itemId === 'boosterenergy';
-		if ((inSun || hasBooster) && getHighestStatName(mon.stats) === 'spe') {
+		const hasVolatile = mon.volatiles?.includes('protosynthesis');
+		if ((inSun || hasBooster || hasVolatile) && getHighestStatName(mon.stats) === 'spe') {
 			speed = Math.floor(speed * 1.5);
 		}
 	}
@@ -113,7 +114,8 @@ export function getEffectiveSpeed(mon: MonState, field: FieldState): number {
 	if (mon.abilityId === 'quarkdrive') {
 		const inTerrain = field.terrain === 'Electric Terrain';
 		const hasBooster = mon.itemId === 'boosterenergy';
-		if ((inTerrain || hasBooster) && getHighestStatName(mon.stats) === 'spe') {
+		const hasVolatile = mon.volatiles?.includes('quarkdrive');
+		if ((inTerrain || hasBooster || hasVolatile) && getHighestStatName(mon.stats) === 'spe') {
 			speed = Math.floor(speed * 1.5);
 		}
 	}
@@ -134,8 +136,16 @@ export function getSpeedComparison(
 	p2: MonState, p2Move: MoveInfo | null,
 	field: FieldState
 ): SpeedResult {
-	const p1Pri = p1Move?.priority ?? 0;
-	const p2Pri = p2Move?.priority ?? 0;
+	let p1Pri = p1Move?.priority ?? 0;
+	let p2Pri = p2Move?.priority ?? 0;
+
+	// Gale Wings: +1 priority for Flying-type moves at full HP
+	if (p1.abilityId === 'galewings' && p1Move?.type === 'Flying' && p1.hp === p1.maxhp) {
+		p1Pri += 1;
+	}
+	if (p2.abilityId === 'galewings' && p2Move?.type === 'Flying' && p2.hp === p2.maxhp) {
+		p2Pri += 1;
+	}
 
 	if (p1Pri !== p2Pri) {
 		return {
@@ -180,6 +190,7 @@ export interface CalcOptions {
 	roll?: number;        // 85-100, for specific roll; omit for analytical
 	field?: FieldState;
 	attackerSide?: 'p1' | 'p2';  // for screen lookup
+	defenderJustSwitched?: boolean;  // for Stakeout: true if defender switched in this turn
 }
 
 /**
@@ -201,8 +212,26 @@ export function calcDamage(
 		return makeDamageResult(0, 0, 0, move, defender, 1);
 	}
 
-	// Determine move type (respecting Tera type changes, etc.)
-	const moveType = move.type;
+	// Determine move type (respecting Tera type changes, -ate abilities, etc.)
+	let moveType = move.type;
+
+	// -ate abilities: convert Normal moves to the ability's type + 1.2x BP
+	let ateBoost = false;
+	if (move.type === 'Normal') {
+		if (attacker.abilityId === 'pixilate') {
+			moveType = 'Fairy';
+			ateBoost = true;
+		} else if (attacker.abilityId === 'galvanize') {
+			moveType = 'Electric';
+			ateBoost = true;
+		} else if (attacker.abilityId === 'refrigerate') {
+			moveType = 'Ice';
+			ateBoost = true;
+		} else if (attacker.abilityId === 'aerilate') {
+			moveType = 'Flying';
+			ateBoost = true;
+		}
+	}
 
 	// Get the defender's effective defensive types (respects terastallization)
 	const defTypes = getDefensiveTypes(defender);
@@ -215,8 +244,14 @@ export function calcDamage(
 		}
 	}
 
+	// Mold Breaker family: ignore defender's ability for immunity/defensive checks
+	const moldBreaker = attacker.abilityId === 'moldbreaker'
+		|| attacker.abilityId === 'teravolt'
+		|| attacker.abilityId === 'turboblaze';
+
 	// Ability-based immunities (Levitate vs Ground, Water Absorb vs Water, etc.)
-	if (checkAbilityImmunity(defender, moveType, move)) {
+	// Mold Breaker bypasses these
+	if (!moldBreaker && checkAbilityImmunity(defender, moveType, move)) {
 		return makeDamageResult(0, 0, 0, move, defender, 0);
 	}
 
@@ -248,6 +283,11 @@ export function calcDamage(
 	// Ability-based BP modifications
 	basePower = applyAbilityBasePower(basePower, move, attacker, defender);
 
+	// -ate ability BP boost: 1.2x when Normal move is type-converted
+	if (ateBoost) {
+		basePower = modify(basePower, 4915, 4096); // 1.2x
+	}
+
 	// Terrain BP boosts (grounded attackers only — Levitate/Air Balloon aren't grounded)
 	if (field?.terrain) {
 		const grounded = attacker.abilityId !== 'levitate' && attacker.itemId !== 'airballoon'
@@ -277,7 +317,15 @@ export function calcDamage(
 	const isPhysical = move.category === 'Physical';
 	const isCrit = options.isCrit ?? false;
 
-	let atkBoost = isPhysical ? attacker.boosts.atk : attacker.boosts.spa;
+	// Body Press (overrideOffensiveStat): uses attacker's Defense instead of Attack
+	const useOverrideStat = move.overrideOffensiveStat || (move.id === 'bodypress' ? 'def' : null);
+
+	let atkBoost: number;
+	if (useOverrideStat === 'def') {
+		atkBoost = attacker.boosts.def;
+	} else {
+		atkBoost = isPhysical ? attacker.boosts.atk : attacker.boosts.spa;
+	}
 	let defBoost = isPhysical ? defender.boosts.def : defender.boosts.spd;
 
 	// Psyshock/Psystrike/Secret Sword: special move using physical defense
@@ -304,7 +352,11 @@ export function calcDamage(
 	let attack: number;
 	let defense: number;
 
-	if (isPhysical) {
+	if (useOverrideStat === 'def') {
+		// Body Press: use attacker's Defense stat for offense
+		attack = applyBoost(attacker.stats.def, atkBoost);
+		defense = applyBoost(defender.stats.def, defBoost);
+	} else if (isPhysical) {
 		attack = applyBoost(attacker.stats.atk, atkBoost);
 		defense = applyBoost(defender.stats.def, defBoost);
 	} else {
@@ -318,8 +370,8 @@ export function calcDamage(
 	}
 
 	// ─── Ability stat modifications ─────────────────
-	attack = applyAbilityAttackMod(attack, attacker, isPhysical, field, defender);
-	defense = applyAbilityDefenseMod(defense, defender, isPhysical, field, attacker);
+	attack = applyAbilityAttackMod(attack, attacker, isPhysical, field, defender, options, moveType);
+	defense = applyAbilityDefenseMod(defense, defender, isPhysical, field, attacker, moldBreaker);
 
 	// Item stat modifications
 	attack = applyItemAttackMod(attack, attacker, isPhysical);
@@ -384,7 +436,7 @@ export function calcDamage(
 	}
 
 	// Step 9: Final modifiers (screens, Life Orb, Tinted Lens, etc.)
-	const finalMod4096 = getFinalModifier4096(attacker, defender, move, isCrit, typeMod, field, options);
+	const finalMod4096 = getFinalModifier4096(attacker, defender, move, isCrit, typeMod, field, options, moldBreaker);
 	if (finalMod4096 !== 4096) {
 		minD = tr((tr(minD * finalMod4096) + 2047) / 4096);
 		maxD = tr((tr(maxD * finalMod4096) + 2047) / 4096);
@@ -544,6 +596,12 @@ function getSTABMultiplier(attacker: MonState, moveType: string): number {
 		return 1.5;
 	}
 
+	// Libero/Protean: type changes to move's type before attacking (once per switch-in in Gen 9)
+	// We model this as always getting STAB since we calc one move at a time
+	if (attacker.abilityId === 'libero' || attacker.abilityId === 'protean') {
+		return 1.5;
+	}
+
 	// No STAB
 	return 1;
 }
@@ -649,7 +707,8 @@ function getFinalModifier4096(
 	isCrit: boolean,
 	typeMod: number,
 	field?: FieldState,
-	options?: CalcOptions
+	options?: CalcOptions,
+	moldBreaker?: boolean
 ): number {
 	let mod = 4096;
 
@@ -692,6 +751,8 @@ function getFinalModifier4096(
 	}
 
 	// ─── Defender Ability Final Modifiers ────────────
+	// Mold Breaker family bypasses all breakable defender abilities
+	if (!moldBreaker) {
 
 	// Multiscale / Shadow Shield: halves damage at full HP
 	if ((defender.abilityId === 'multiscale' || defender.abilityId === 'shadowshield') &&
@@ -744,6 +805,8 @@ function getFinalModifier4096(
 	if (defender.abilityId === 'purifyingsalt' && move.type === 'Ghost') {
 		mod = chainMod(mod, 0.5);
 	}
+
+	} // end if (!moldBreaker)
 
 	// Type-resist berries (halve SE damage, then consumed)
 	// We don't track berry consumption, but can check if defender holds one
@@ -956,7 +1019,7 @@ function applyAbilityBasePower(bp: number, move: MoveInfo, attacker: MonState, _
 	return bp;
 }
 
-function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: boolean, field?: FieldState, defender?: MonState): number {
+function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: boolean, field?: FieldState, defender?: MonState, options?: CalcOptions, moveType?: string): number {
 	// Huge Power / Pure Power: 2x Atk
 	if ((attacker.abilityId === 'hugepower' || attacker.abilityId === 'purepower') && isPhysical) {
 		attack = modify(attack, 2);
@@ -998,11 +1061,12 @@ function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: b
 	}
 
 	// Protosynthesis: boost highest stat by 1.3x (1.5x for Speed) in Sun or with Booster Energy
-	// We approximate: check if Sun is active or item is Booster Energy
+	// We approximate: check if Sun is active, item is Booster Energy, or volatile is present
 	if (attacker.abilityId === 'protosynthesis') {
 		const inSun = field?.weather === 'SunnyDay' || field?.weather === 'Desolate Land';
 		const hasBooster = attacker.itemId === 'boosterenergy';
-		if (inSun || hasBooster) {
+		const hasVolatile = attacker.volatiles?.includes('protosynthesis');
+		if (inSun || hasBooster || hasVolatile) {
 			// Determine highest stat (excluding HP)
 			const stats = attacker.stats;
 			const highest = getHighestStatName(stats);
@@ -1018,7 +1082,8 @@ function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: b
 	if (attacker.abilityId === 'quarkdrive') {
 		const inTerrain = field?.terrain === 'Electric Terrain';
 		const hasBooster = attacker.itemId === 'boosterenergy';
-		if (inTerrain || hasBooster) {
+		const hasVolatile = attacker.volatiles?.includes('quarkdrive');
+		if (inTerrain || hasBooster || hasVolatile) {
 			const stats = attacker.stats;
 			const highest = getHighestStatName(stats);
 			if (isPhysical && highest === 'atk') {
@@ -1037,6 +1102,18 @@ function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: b
 	// We can't determine fainted allies from a 1v1 context, but in full team context we could
 	// For now, skip — this is handled better in the eval layer
 
+	// Flash Fire activated boost: 1.5x to both Atk and SpA for Fire moves
+	// The sim sets a 'flashfire' volatile when a Fire move is absorbed
+	if (attacker.abilityId === 'flashfire' && moveType === 'Fire' && attacker.volatiles?.includes('flashfire')) {
+		// Flash Fire boosts Fire moves via both onModifyAtk and onModifySpA
+		attack = modify(attack, 1.5);
+	}
+
+	// Stakeout: 2x Atk/SpA when defender just switched in (activeTurns === 0)
+	if (attacker.abilityId === 'stakeout' && options?.defenderJustSwitched) {
+		attack = modify(attack, 2);
+	}
+
 	return attack;
 }
 
@@ -1052,7 +1129,29 @@ function getHighestStatName(stats: { atk: number; def: number; spa: number; spd:
 	return entries[0][0];
 }
 
-function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical: boolean, field?: FieldState, attacker?: MonState): number {
+function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical: boolean, field?: FieldState, attacker?: MonState, moldBreaker?: boolean): number {
+	// Mold Breaker family bypasses breakable defender abilities
+	// (Fur Coat, Marvel Scale, Ice Scales are all breakable)
+	if (moldBreaker) {
+		// Still apply non-ability defense mods (Sand SpD, items)
+		// Sand: 1.5x SpD for Rock types
+		if (field?.weather === 'Sandstorm' && !isPhysical && defender.types.includes('Rock')) {
+			defense = modify(defense, 1.5);
+		}
+		// Assault Vest: 1.5x SpD
+		if (defender.itemId === 'assaultvest' && !isPhysical) {
+			defense = modify(defense, 1.5);
+		}
+		// Ruin abilities on attacker still apply (they're on the attacker, not defender)
+		if (attacker?.abilityId === 'swordofruin' && isPhysical) {
+			defense = modify(defense, 3072, 4096);
+		}
+		if (attacker?.abilityId === 'beadsofruin' && !isPhysical) {
+			defense = modify(defense, 3072, 4096);
+		}
+		return defense;
+	}
+
 	// Fur Coat: 2x Def
 	if (defender.abilityId === 'furcoat' && isPhysical) {
 		defense = modify(defense, 2);
@@ -1093,7 +1192,8 @@ function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical:
 	if (defender.abilityId === 'protosynthesis') {
 		const inSun = field?.weather === 'SunnyDay' || field?.weather === 'Desolate Land';
 		const hasBooster = defender.itemId === 'boosterenergy';
-		if (inSun || hasBooster) {
+		const hasVolatile = defender.volatiles?.includes('protosynthesis');
+		if (inSun || hasBooster || hasVolatile) {
 			const highest = getHighestStatName(defender.stats);
 			if (isPhysical && highest === 'def') {
 				defense = modify(defense, 5325, 4096);
@@ -1106,7 +1206,8 @@ function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical:
 	if (defender.abilityId === 'quarkdrive') {
 		const inTerrain = field?.terrain === 'Electric Terrain';
 		const hasBooster = defender.itemId === 'boosterenergy';
-		if (inTerrain || hasBooster) {
+		const hasVolatile = defender.volatiles?.includes('quarkdrive');
+		if (inTerrain || hasBooster || hasVolatile) {
 			const highest = getHighestStatName(defender.stats);
 			if (isPhysical && highest === 'def') {
 				defense = modify(defense, 5325, 4096);

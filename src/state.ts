@@ -327,6 +327,7 @@ export function extractMonState(pokemon: any, index: number): MonState {
 			critRatio: moveData.critRatio || 1,
 			multihit: moveData.multihit || null,
 			target: moveData.target,
+			overrideOffensiveStat: moveData.overrideOffensiveStat || undefined,
 		};
 	});
 
@@ -362,6 +363,8 @@ export function extractMonState(pokemon: any, index: number): MonState {
 		nature: pokemon.set?.nature || '',
 		gender: pokemon.gender || '',
 		position: index,
+		lastItemId: SimDex.toID(pokemon.lastItem || ''),
+		volatiles: Object.keys(pokemon.volatiles || {}),
 	};
 }
 

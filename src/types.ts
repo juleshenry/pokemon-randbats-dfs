@@ -85,6 +85,7 @@ export interface MoveInfo {
 	critRatio: number;                 // 1 = normal, 2 = high crit, etc.
 	multihit: number | number[] | null;
 	target: string;
+	overrideOffensiveStat?: string;    // e.g., 'def' for Body Press
 }
 
 // ─── Monster State ───────────────────────────────────────────────
@@ -114,6 +115,8 @@ export interface MonState {
 	nature: string;
 	gender: string;
 	position: number;           // index in side.pokemon[]
+	lastItemId: string;         // last consumed item (for Booster Energy detection)
+	volatiles: string[];        // active volatile status IDs (e.g. 'quarkdrive', 'protosynthesis')
 }
 
 // ─── Damage Calculation ──────────────────────────────────────────
