@@ -1651,7 +1651,7 @@ describe('Damage Calculator', () => {
 			expect(normalResult.expected).to.be.greaterThan(0);
 		});
 
-		it('Freeze-Dry vs Water/Ground (Gastrodon): SE despite Ice resistance from Ground', () => {
+		it('Freeze-Dry vs Water/Ground (Gastrodon): 4x SE (Ice SE vs Ground + Freeze-Dry SE vs Water)', () => {
 			const battle = create1v1Battle(
 				makeSet('Lapras', ['Freeze-Dry', 'Surf', 'Thunderbolt', 'Ice Beam']),
 				makeSet('Gastrodon', ['Scald', 'Recover', 'Toxic', 'Earth Power'])
@@ -1662,35 +1662,32 @@ describe('Damage Calculator', () => {
 
 			const result = calcDamage(atk, def, fd);
 			// Freeze-Dry vs Water/Ground:
-			// Normal Ice vs Ground = neutral (1x)
-			// But Freeze-Dry is SE vs Water → 2x
-			// Net: 2x
-			expect(result.effectiveness).to.equal(2);
+			// Ice vs Ground = SE (2x)
+			// Freeze-Dry is SE vs Water → another 2x
+			// Net: 4x
+			expect(result.effectiveness).to.equal(4);
 			expect(result.expected).to.be.greaterThan(0);
 		});
 
-		it('Scrappy: Normal/Fighting hits Ghost', () => {
+		it('Scrappy: Fighting hits Ghost (Flamigo vs Gengar)', () => {
 			const battle = create1v1Battle(
-				makeSet('Kangaskhan', ['Return', 'Earthquake', 'Sucker Punch', 'Power-Up Punch'],
+				makeSet('Flamigo', ['Brave Bird', 'Close Combat', 'Throat Chop', 'U-turn'],
 					{ ability: 'Scrappy' }),
-				makeSet('Gengar', ['Shadow Ball', 'Sludge Bomb', 'Thunderbolt', 'Nasty Plot'])
+				makeSet('Gengar', ['Shadow Ball', 'Sludge Wave', 'Focus Blast', 'Nasty Plot'],
+					{ ability: 'Cursed Body' })
 			);
 			const atk = getMon(battle, 0);
 			const def = getMon(battle, 1);
-			// Return is not in the data, let's use a different normal move
-			// Actually Return was removed in Gen 9 — let's check what moves Kangaskhan has
-			const moves = atk.moves.map(m => `${m.name}(${m.type})`);
+			const closeCombat = getMove(atk, 'Close Combat'); // Fighting type
 
-			// Find a Normal-type move
-			const normalMove = atk.moves.find(m => m.type === 'Normal' && m.category !== 'Status');
-			if (!normalMove) {
-				// Skip if no Normal damaging move available
-				return;
-			}
-
-			const result = calcDamage(atk, def, normalMove);
-			// Scrappy lets Normal hit Ghost
+			const result = calcDamage(atk, def, closeCombat);
+			// Scrappy lets Fighting hit Ghost
 			expect(result.expected).to.be.greaterThan(0);
+
+			// Without Scrappy: Fighting vs Ghost is immune
+			const noScrappy = { ...atk, abilityId: 'moldbreaker', ability: 'Mold Breaker' };
+			const immuneResult = calcDamage(noScrappy, def, closeCombat);
+			expect(immuneResult.expected).to.equal(0);
 		});
 
 		it('Weather: Rain boosts Water, weakens Fire', () => {

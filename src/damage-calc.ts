@@ -92,6 +92,32 @@ export function getEffectiveSpeed(mon: MonState, field: FieldState): number {
 	if (mon.abilityId === 'sandrush' && field.weather === 'Sandstorm') speed *= 2;
 	if (mon.abilityId === 'slushrush' && field.weather === 'Snow') speed *= 2;
 
+	// Surge Surfer: 2x speed in Electric Terrain
+	if (mon.abilityId === 'surgesurfer' && field.terrain === 'Electric Terrain') speed *= 2;
+
+	// Quick Feet: 1.5x speed when statused (already prevents paralysis halving above)
+	if (mon.abilityId === 'quickfeet' && mon.status) {
+		speed = Math.floor(speed * 1.5);
+	}
+
+	// Protosynthesis speed boost (1.5x if Spe is highest stat, in Sun or with Booster Energy)
+	if (mon.abilityId === 'protosynthesis') {
+		const inSun = field.weather === 'SunnyDay' || field.weather === 'Desolate Land';
+		const hasBooster = mon.itemId === 'boosterenergy';
+		if ((inSun || hasBooster) && getHighestStatName(mon.stats) === 'spe') {
+			speed = Math.floor(speed * 1.5);
+		}
+	}
+
+	// Quark Drive speed boost (1.5x if Spe is highest stat, in Electric Terrain or with Booster Energy)
+	if (mon.abilityId === 'quarkdrive') {
+		const inTerrain = field.terrain === 'Electric Terrain';
+		const hasBooster = mon.itemId === 'boosterenergy';
+		if ((inTerrain || hasBooster) && getHighestStatName(mon.stats) === 'spe') {
+			speed = Math.floor(speed * 1.5);
+		}
+	}
+
 	// Iron Ball halves speed
 	if (mon.itemId === 'ironball') {
 		speed = Math.floor(speed / 2);
@@ -190,12 +216,16 @@ export function calcDamage(
 	}
 
 	// Ability-based immunities (Levitate vs Ground, Water Absorb vs Water, etc.)
-	if (checkAbilityImmunity(defender, moveType)) {
+	if (checkAbilityImmunity(defender, moveType, move)) {
 		return makeDamageResult(0, 0, 0, move, defender, 0);
 	}
 
 	// Type effectiveness
-	let effectiveness = getTypeEffectiveness(moveType, defTypes);
+	// If ability negates immunity (e.g., Scrappy), compute effectiveness ignoring immunities
+	const ignoreImmunity = abilityNegatesImmunity(attacker, defender, moveType);
+	let effectiveness = ignoreImmunity
+		? getTypeEffectivenessNoImmunity(moveType, defTypes)
+		: getTypeEffectiveness(moveType, defTypes);
 
 	// Freeze-Dry is super effective against Water
 	if (move.id === 'freezedry' && defTypes.includes('Water')) {
@@ -217,6 +247,29 @@ export function calcDamage(
 
 	// Ability-based BP modifications
 	basePower = applyAbilityBasePower(basePower, move, attacker, defender);
+
+	// Terrain BP boosts (grounded attackers only — Levitate/Air Balloon aren't grounded)
+	if (field?.terrain) {
+		const grounded = attacker.abilityId !== 'levitate' && attacker.itemId !== 'airballoon'
+			&& !attacker.types.includes('Flying');
+		if (grounded) {
+			if (field.terrain === 'Electric Terrain' && moveType === 'Electric') {
+				basePower = modify(basePower, 5325, 4096); // 1.3x
+			} else if (field.terrain === 'Grassy Terrain' && moveType === 'Grass') {
+				basePower = modify(basePower, 5325, 4096); // 1.3x
+			} else if (field.terrain === 'Psychic Terrain' && moveType === 'Psychic') {
+				basePower = modify(basePower, 5325, 4096); // 1.3x
+			}
+		}
+		// Misty Terrain: halves Dragon damage to grounded defenders
+		if (field.terrain === 'Misty Terrain' && moveType === 'Dragon') {
+			const defGrounded = defender.abilityId !== 'levitate' && defender.itemId !== 'airballoon'
+				&& !defender.types.includes('Flying');
+			if (defGrounded) {
+				basePower = modify(basePower, 2048, 4096); // 0.5x
+			}
+		}
+	}
 
 	if (basePower <= 0) basePower = 1;
 
@@ -265,8 +318,8 @@ export function calcDamage(
 	}
 
 	// ─── Ability stat modifications ─────────────────
-	attack = applyAbilityAttackMod(attack, attacker, isPhysical);
-	defense = applyAbilityDefenseMod(defense, defender, isPhysical, field);
+	attack = applyAbilityAttackMod(attack, attacker, isPhysical, field, defender);
+	defense = applyAbilityDefenseMod(defense, defender, isPhysical, field, attacker);
 
 	// Item stat modifications
 	attack = applyItemAttackMod(attack, attacker, isPhysical);
@@ -317,7 +370,7 @@ export function calcDamage(
 	// Step 7: Type effectiveness
 	// SE: *= 2 per step (no trunc between)
 	// NVE: tr(/2) per step
-	const typeMod = getTypeMod(moveType, defender, move);
+	const typeMod = getTypeMod(moveType, defender, move, attacker);
 	minD = applyTypeMod(minD, typeMod);
 	maxD = applyTypeMod(maxD, typeMod);
 	expD = applyTypeModFloat(expD, typeMod);
@@ -410,6 +463,10 @@ export function calcDamageWithCrit(
  */
 function getAccuracyRate(move: MoveInfo, attacker: MonState, defender: MonState): number {
 	if (move.accuracy === true) return 1;
+
+	// No Guard: all moves hit (both sides)
+	if (attacker.abilityId === 'noguard' || defender.abilityId === 'noguard') return 1;
+
 	let acc = move.accuracy;
 
 	// Compound Eyes
@@ -427,7 +484,13 @@ function getAccuracyRate(move: MoveInfo, attacker: MonState, defender: MonState)
 
 	// Accuracy/evasion boosts
 	const accBoost = attacker.boosts.accuracy || 0;
-	const evaBoost = defender.boosts.evasion || 0;
+	let evaBoost = defender.boosts.evasion || 0;
+
+	// Mind's Eye / Keen Eye: ignore evasion boosts
+	if (attacker.abilityId === 'mindseye' || attacker.abilityId === 'keeneye') {
+		if (evaBoost > 0) evaBoost = 0;
+	}
+
 	const netBoost = accBoost - evaBoost;
 
 	if (netBoost > 0) {
@@ -488,10 +551,12 @@ function getSTABMultiplier(attacker: MonState, moveType: string): number {
 /**
  * Get the type modifier as an integer (+1 per SE, -1 per resist).
  */
-function getTypeMod(moveType: string, defender: MonState, move: MoveInfo): number {
+function getTypeMod(moveType: string, defender: MonState, move: MoveInfo, attacker?: MonState): number {
 	let typeMod = 0;
 	const dex = getDex();
 	const defTypes = getDefensiveTypes(defender);
+	// Check if attacker has an ability that negates type immunity
+	const ignoresImmunity = attacker ? abilityNegatesImmunity(attacker, defender, moveType) : false;
 
 	for (const defType of defTypes) {
 		// Freeze-Dry special case
@@ -500,9 +565,10 @@ function getTypeMod(moveType: string, defender: MonState, move: MoveInfo): numbe
 			continue;
 		}
 
-		// Immunity check
+		// Immunity check (skip if ability negates it)
 		if (!dex.getImmunity(moveType, defType)) {
-			return -999; // signal immunity
+			if (!ignoresImmunity) return -999; // signal immunity
+			continue; // Scrappy/Mind's Eye: treat as neutral, skip this type
 		}
 
 		const eff = dex.getEffectiveness(moveType, defType);
@@ -625,7 +691,59 @@ function getFinalModifier4096(
 		mod = chainMod(mod, 4915, 4096);
 	}
 
-	// Metronome item (not the move): boosts by 1.2x per consecutive use (we don't track this)
+	// ─── Defender Ability Final Modifiers ────────────
+
+	// Multiscale / Shadow Shield: halves damage at full HP
+	if ((defender.abilityId === 'multiscale' || defender.abilityId === 'shadowshield') &&
+		defender.hp === defender.maxhp) {
+		mod = chainMod(mod, 0.5);
+	}
+
+	// Filter / Solid Rock / Prism Armor: 0.75x on super-effective moves
+	if ((defender.abilityId === 'filter' || defender.abilityId === 'solidrock' || defender.abilityId === 'prismarmor') &&
+		typeMod > 0) {
+		mod = chainMod(mod, 3072, 4096);
+	}
+
+	// Fluffy: halves contact damage, doubles Fire damage taken
+	if (defender.abilityId === 'fluffy') {
+		if (move.flags && move.flags['contact']) {
+			mod = chainMod(mod, 0.5);
+		}
+		if (move.type === 'Fire') {
+			mod = chainMod(mod, 2);
+		}
+	}
+
+	// Punk Rock (defender): halves sound damage taken
+	if (defender.abilityId === 'punkrock' && move.flags && move.flags['sound']) {
+		mod = chainMod(mod, 0.5);
+	}
+
+	// Thick Fat: halves Fire and Ice damage
+	if (defender.abilityId === 'thickfat' && (move.type === 'Fire' || move.type === 'Ice')) {
+		mod = chainMod(mod, 0.5);
+	}
+
+	// Heatproof: halves Fire damage
+	if (defender.abilityId === 'heatproof' && move.type === 'Fire') {
+		mod = chainMod(mod, 0.5);
+	}
+
+	// Dry Skin: 1.25x Fire damage taken (water immunity handled in checkAbilityImmunity)
+	if (defender.abilityId === 'dryskin' && move.type === 'Fire') {
+		mod = chainMod(mod, 5120, 4096); // 1.25x
+	}
+
+	// Water Bubble (defender): halves Fire damage taken
+	if (defender.abilityId === 'waterbubble' && move.type === 'Fire') {
+		mod = chainMod(mod, 0.5);
+	}
+
+	// Purifying Salt: halves Ghost damage taken
+	if (defender.abilityId === 'purifyingsalt' && move.type === 'Ghost') {
+		mod = chainMod(mod, 0.5);
+	}
 
 	// Type-resist berries (halve SE damage, then consumed)
 	// We don't track berry consumption, but can check if defender holds one
@@ -759,10 +877,6 @@ function applyAbilityBasePower(bp: number, move: MoveInfo, attacker: MonState, _
 		bp = Math.floor(bp * 1.5);
 	}
 
-	// Aerilate/Pixilate/Refrigerate/Galvanize: 1.2x for converted Normal moves
-	// (We don't track type conversion here, but the BP boost applies)
-	// This would need type conversion tracking - skip for now as it changes the move type
-
 	// Sheer Force: ~1.3x if move has secondary effect
 	if (attacker.abilityId === 'sheerforce' && (move.secondary || (move.secondaries && move.secondaries.length > 0))) {
 		bp = modify(bp, 5325, 4096);
@@ -793,10 +907,56 @@ function applyAbilityBasePower(bp: number, move: MoveInfo, attacker: MonState, _
 		bp = modify(bp, 5325, 4096);
 	}
 
+	// Sharpness: 1.5x for slicing moves
+	if (attacker.abilityId === 'sharpness' && move.flags && move.flags['slicing']) {
+		bp = modify(bp, 6144, 4096);
+	}
+
+	// Dragon's Maw: 1.5x for Dragon-type moves
+	if (attacker.abilityId === 'dragonsmaw' && move.type === 'Dragon') {
+		bp = modify(bp, 6144, 4096);
+	}
+
+	// Transistor: 1.3x for Electric-type moves (Gen 9: nerfed from 1.5x to 1.3x)
+	if (attacker.abilityId === 'transistor' && move.type === 'Electric') {
+		bp = modify(bp, 5325, 4096);
+	}
+
+	// Rocky Payload: 1.5x for Rock-type moves
+	if (attacker.abilityId === 'rockypayload' && move.type === 'Rock') {
+		bp = modify(bp, 6144, 4096);
+	}
+
+	// Steely Spirit: 1.5x for Steel-type moves
+	if (attacker.abilityId === 'steelyspirit' && move.type === 'Steel') {
+		bp = modify(bp, 6144, 4096);
+	}
+
+	// Punk Rock: 1.3x for sound moves
+	if (attacker.abilityId === 'punkrock' && move.flags && move.flags['sound']) {
+		bp = modify(bp, 5325, 4096);
+	}
+
+	// Water Bubble: 2x for Water-type moves
+	if (attacker.abilityId === 'waterbubble' && move.type === 'Water') {
+		bp = modify(bp, 2);
+	}
+
+	// Analytic: 1.3x if moving last (we approximate: assume 50% of time moving last)
+	// In tree search context, speed comparison would determine this more accurately
+	// For now, we flag it but don't apply automatically — the eval/minimax will handle
+	// Actually: apply it always as a heuristic since it's a consistent damage boost for slow mons
+	if (attacker.abilityId === 'analytic') {
+		bp = modify(bp, 5325, 4096);
+	}
+
+	// Stakeout: 2x against switching targets (positional — can't determine from static calc)
+	// We do NOT apply this by default; it's handled in eval/minimax context
+
 	return bp;
 }
 
-function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: boolean): number {
+function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: boolean, field?: FieldState, defender?: MonState): number {
 	// Huge Power / Pure Power: 2x Atk
 	if ((attacker.abilityId === 'hugepower' || attacker.abilityId === 'purepower') && isPhysical) {
 		attack = modify(attack, 2);
@@ -812,31 +972,97 @@ function applyAbilityAttackMod(attack: number, attacker: MonState, isPhysical: b
 		attack = modify(attack, 1.5);
 	}
 
-	// Solar Power: 1.5x SpA in Sun (but loses HP — handled elsewhere)
-	// Would need field context here
-
-	// Overgrow/Blaze/Torrent/Swarm: 1.5x when HP <= 33%
-	const pinchAbilities: Record<string, { stat: boolean; type: string }> = {
-		overgrow: { stat: true, type: 'Grass' },
-		blaze: { stat: true, type: 'Fire' },
-		torrent: { stat: true, type: 'Water' },
-		swarm: { stat: true, type: 'Bug' },
-	};
-	// These actually boost the move's BP, not the stat, but the effect is similar
-	// We handle them here for simplicity
-
 	// Guts: 1.5x Atk when statused
 	if (attacker.abilityId === 'guts' && attacker.status && isPhysical) {
 		attack = modify(attack, 1.5);
 	}
 
+	// Toxic Boost: 1.5x Atk when poisoned
+	if (attacker.abilityId === 'toxicboost' && (attacker.status === 'psn' || attacker.status === 'tox') && isPhysical) {
+		attack = modify(attack, 1.5);
+	}
+
+	// Orichalcum Pulse: 1.3333x Atk in Sun
+	if (attacker.abilityId === 'orichalcumpulse' && isPhysical) {
+		// Orichalcum Pulse sets Sun on switch-in; boost applies in Sun
+		if (field?.weather === 'SunnyDay' || field?.weather === 'Desolate Land') {
+			attack = modify(attack, 5461, 4096);
+		}
+	}
+
+	// Hadron Engine: 1.3333x SpA in Electric Terrain
+	if (attacker.abilityId === 'hadronengine' && !isPhysical) {
+		if (field?.terrain === 'Electric Terrain') {
+			attack = modify(attack, 5461, 4096);
+		}
+	}
+
+	// Protosynthesis: boost highest stat by 1.3x (1.5x for Speed) in Sun or with Booster Energy
+	// We approximate: check if Sun is active or item is Booster Energy
+	if (attacker.abilityId === 'protosynthesis') {
+		const inSun = field?.weather === 'SunnyDay' || field?.weather === 'Desolate Land';
+		const hasBooster = attacker.itemId === 'boosterenergy';
+		if (inSun || hasBooster) {
+			// Determine highest stat (excluding HP)
+			const stats = attacker.stats;
+			const highest = getHighestStatName(stats);
+			if (isPhysical && highest === 'atk') {
+				attack = modify(attack, 5325, 4096); // 1.3x
+			} else if (!isPhysical && highest === 'spa') {
+				attack = modify(attack, 5325, 4096); // 1.3x
+			}
+		}
+	}
+
+	// Quark Drive: same as Protosynthesis but in Electric Terrain
+	if (attacker.abilityId === 'quarkdrive') {
+		const inTerrain = field?.terrain === 'Electric Terrain';
+		const hasBooster = attacker.itemId === 'boosterenergy';
+		if (inTerrain || hasBooster) {
+			const stats = attacker.stats;
+			const highest = getHighestStatName(stats);
+			if (isPhysical && highest === 'atk') {
+				attack = modify(attack, 5325, 4096); // 1.3x
+			} else if (!isPhysical && highest === 'spa') {
+				attack = modify(attack, 5325, 4096); // 1.3x
+			}
+		}
+	}
+
+	// Intrepid Sword: +1 Atk on switch-in (we model as being active if position == 0 and no boosts applied yet)
+	// This is tricky — the sim applies this as a boost, so it should already be reflected in mon.boosts.atk
+	// No special handling needed here since the boost is captured in extractMonState
+
+	// Supreme Overlord: +10% Atk/SpA per fainted ally (up to +50%)
+	// We can't determine fainted allies from a 1v1 context, but in full team context we could
+	// For now, skip — this is handled better in the eval layer
+
 	return attack;
 }
 
-function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical: boolean, field?: FieldState): number {
+/**
+ * Determine which non-HP stat is highest (for Protosynthesis/Quark Drive).
+ */
+function getHighestStatName(stats: { atk: number; def: number; spa: number; spd: number; spe: number }): string {
+	const entries: [string, number][] = [
+		['atk', stats.atk], ['def', stats.def], ['spa', stats.spa],
+		['spd', stats.spd], ['spe', stats.spe],
+	];
+	entries.sort((a, b) => b[1] - a[1]);
+	return entries[0][0];
+}
+
+function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical: boolean, field?: FieldState, attacker?: MonState): number {
 	// Fur Coat: 2x Def
 	if (defender.abilityId === 'furcoat' && isPhysical) {
 		defense = modify(defense, 2);
+	}
+
+	// Fluffy: halves contact damage (2x Def for contact), but doubles Fire damage
+	// The contact half is a defense mod; Fire double is handled in final modifier
+	if (defender.abilityId === 'fluffy' && isPhysical) {
+		// Check if the attacking move is contact — we need the move info
+		// This is imperfect since we don't have move here; handled in getFinalModifier instead
 	}
 
 	// Marvel Scale: 1.5x Def when statused
@@ -849,6 +1075,10 @@ function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical:
 		defense = modify(defense, 2);
 	}
 
+	// Dauntless Shield: +1 Def on switch-in
+	// This is applied as a boost by the sim, already captured in mon.boosts.def
+	// No special handling needed
+
 	// Sand: 1.5x SpD for Rock types
 	if (field?.weather === 'Sandstorm' && !isPhysical && defender.types.includes('Rock')) {
 		defense = modify(defense, 1.5);
@@ -857,6 +1087,56 @@ function applyAbilityDefenseMod(defense: number, defender: MonState, isPhysical:
 	// Assault Vest: 1.5x SpD
 	if (defender.itemId === 'assaultvest' && !isPhysical) {
 		defense = modify(defense, 1.5);
+	}
+
+	// Protosynthesis/Quark Drive defense boosts
+	if (defender.abilityId === 'protosynthesis') {
+		const inSun = field?.weather === 'SunnyDay' || field?.weather === 'Desolate Land';
+		const hasBooster = defender.itemId === 'boosterenergy';
+		if (inSun || hasBooster) {
+			const highest = getHighestStatName(defender.stats);
+			if (isPhysical && highest === 'def') {
+				defense = modify(defense, 5325, 4096);
+			} else if (!isPhysical && highest === 'spd') {
+				defense = modify(defense, 5325, 4096);
+			}
+		}
+	}
+
+	if (defender.abilityId === 'quarkdrive') {
+		const inTerrain = field?.terrain === 'Electric Terrain';
+		const hasBooster = defender.itemId === 'boosterenergy';
+		if (inTerrain || hasBooster) {
+			const highest = getHighestStatName(defender.stats);
+			if (isPhysical && highest === 'def') {
+				defense = modify(defense, 5325, 4096);
+			} else if (!isPhysical && highest === 'spd') {
+				defense = modify(defense, 5325, 4096);
+			}
+		}
+	}
+
+	// Sword of Ruin: reduces all opponents' Def by 25% (attacker has it)
+	if (attacker?.abilityId === 'swordofruin' && isPhysical) {
+		defense = modify(defense, 3072, 4096); // 0.75x
+	}
+
+	// Beads of Ruin: reduces all opponents' SpD by 25% (attacker has it)
+	if (attacker?.abilityId === 'beadsofruin' && !isPhysical) {
+		defense = modify(defense, 3072, 4096); // 0.75x
+	}
+
+	// Tablets of Ruin / Vessel of Ruin — these reduce the OPPONENT'S attack stats
+	// They are applied on the attacker side, not here
+	// Handled in applyAbilityAttackMod? No — they reduce the OPPONENT's Atk/SpA
+	// This means if the DEFENDER has Tablets of Ruin, the attacker's Atk is reduced
+	// We handle this here since we have access to defender's ability
+	if (defender.abilityId === 'tabletsofruin' && isPhysical) {
+		// Reduce attacker's effective damage — modeled as 1.33x defense (equivalent to 0.75x attack)
+		defense = modify(defense, 5461, 4096); // ~1.33x def ≈ 0.75x atk
+	}
+	if (defender.abilityId === 'vesselofruin' && !isPhysical) {
+		defense = modify(defense, 5461, 4096); // ~1.33x spd ≈ 0.75x spa
 	}
 
 	return defense;
@@ -889,7 +1169,7 @@ function applyItemDefenseMod(defense: number, defender: MonState, isPhysical: bo
 
 // ─── Ability Immunity Checks ─────────────────────────────────────
 
-function checkAbilityImmunity(defender: MonState, moveType: string): boolean {
+function checkAbilityImmunity(defender: MonState, moveType: string, move?: MoveInfo): boolean {
 	// Levitate: immune to Ground
 	if (defender.abilityId === 'levitate' && moveType === 'Ground') return true;
 
@@ -910,25 +1190,59 @@ function checkAbilityImmunity(defender: MonState, moveType: string): boolean {
 	// Earth Eater: immune to Ground
 	if (defender.abilityId === 'eartheater' && moveType === 'Ground') return true;
 
-	// Wind Rider: immune to Wind moves (not type-based, skip)
-
 	// Well-Baked Body: immune to Fire
 	if (defender.abilityId === 'wellbakedbody' && moveType === 'Fire') return true;
+
+	// Wind Rider: immune to wind moves (Tailwind, etc.) — but most damaging wind moves are niche
+	// Skipped for now — Wind Rider is primarily about Tailwind boost
+
+	// Soundproof: immune to sound-based moves
+	if (defender.abilityId === 'soundproof' && move?.flags && move.flags['sound']) return true;
+
+	// Bulletproof: immune to ball/bomb moves
+	if (defender.abilityId === 'bulletproof' && move?.flags && move.flags['bullet']) return true;
+
+	// Overcoat: immune to powder moves (Spore, Sleep Powder, Stun Spore — mostly status)
+	// Powder moves are almost all status, so this rarely affects damage calc
+	if (defender.abilityId === 'overcoat' && move?.flags && move.flags['powder']) return true;
+
+	// Good as Gold: immune to status moves (already handled by category check, but just in case)
+	if (defender.abilityId === 'goodasgold' && move?.category === 'Status') return true;
 
 	return false;
 }
 
 /**
  * Check if an attacker's ability negates a type immunity
- * (e.g., Scrappy allows Normal/Fighting to hit Ghost)
+ * (e.g., Scrappy allows Normal/Fighting to hit Ghost,
+ *  Mind's Eye allows Normal/Fighting to hit Ghost and ignores evasion)
  */
 function abilityNegatesImmunity(attacker: MonState, _defender: MonState, moveType: string): boolean {
-	// Scrappy: Normal and Fighting can hit Ghost
-	if (attacker.abilityId === 'scrappy' && (moveType === 'Normal' || moveType === 'Fighting')) {
+	// Scrappy / Mind's Eye: Normal and Fighting can hit Ghost
+	if ((attacker.abilityId === 'scrappy' || attacker.abilityId === 'mindseye')
+		&& (moveType === 'Normal' || moveType === 'Fighting')) {
 		return true;
 	}
 
 	return false;
+}
+
+/**
+ * Compute type effectiveness ignoring immunities.
+ * Used when an ability (Scrappy, Mind's Eye) negates type immunity.
+ * Fighting vs Ghost = 1x (neutral, not immune), Normal vs Ghost = 1x.
+ */
+function getTypeEffectivenessNoImmunity(moveType: string, defTypes: string[]): number {
+	const dex = getDex();
+	let multiplier = 1;
+	for (const defType of defTypes) {
+		// Skip immunity — treat as neutral (1x)
+		if (!(dex as any).getImmunity(moveType, defType)) continue;
+		const eff = (dex as any).getEffectiveness(moveType, defType);
+		if (eff > 0) multiplier *= 2;
+		else if (eff < 0) multiplier *= 0.5;
+	}
+	return multiplier;
 }
 
 // ─── Type-resist Berries ─────────────────────────────────────────
