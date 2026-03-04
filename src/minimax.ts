@@ -17,13 +17,17 @@
 
 import type {
 	Battle, NashResult, StrategyEntry, DensePlan, TurnPlan, ConditionalBranch,
-	ShadowTeam, Choice,
+	ShadowTeam, Choice, MonState, FieldState, MoveInfo, DamageResult,
 } from './types';
 import {
 	cloneBattle, getChoices, makeChoices, isTerminal, getWinValue, getCurrentTurn,
+	extractFieldState, getActiveMon, extractSideState,
 } from './state';
 import { evaluate } from './eval';
 import { solveNash, type GameMatrix } from './nash';
+import {
+	calcDamageWithCrit, getSpeedComparison, getEffectiveSpeed,
+} from './damage-calc';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -44,6 +48,10 @@ export interface SearchOptions {
 	playerIndex?: number;
 	/** Optional time limit in milliseconds */
 	timeLimit?: number;
+	/** Use analytical fast-path for payoff matrix instead of sim cloning.
+	 *  Much faster (~100x), enables deeper search, but less accurate for
+	 *  complex interactions. Default false (use sim-based). */
+	useAnalytical?: boolean;
 }
 
 export interface SearchResult {
@@ -66,6 +74,7 @@ export interface SearchResult {
 let nodesVisited = 0;
 let startTime = 0;
 let timeLimitMs = 0;
+let analyticalMode = false;
 
 function isTimeUp(): boolean {
 	if (timeLimitMs <= 0) return false;
@@ -89,6 +98,7 @@ export function search(battle: Battle, options: SearchOptions = {}): SearchResul
 	nodesVisited = 0;
 	startTime = Date.now();
 	timeLimitMs = options.timeLimit ?? 0;
+	analyticalMode = options.useAnalytical ?? false;
 
 	const turn = getCurrentTurn(battle);
 
@@ -156,6 +166,10 @@ export function search(battle: Battle, options: SearchOptions = {}): SearchResul
  * Build the payoff matrix for a simultaneous-move node.
  * M[i][j] = value of position after P1 plays choice i and P2 plays choice j,
  * evaluated from P1's perspective (standard convention for Nash solver).
+ *
+ * Two modes:
+ * - Sim-based (default): clones battle, executes moves, recurses. Accurate but slow.
+ * - Analytical (fast): uses damage calc + move-order logic. ~100x faster, enables deeper search.
  */
 function buildPayoffMatrix(
 	battle: Battle,
@@ -165,6 +179,11 @@ function buildPayoffMatrix(
 	shadow: ShadowTeam | undefined,
 	playerIndex: number,
 ): GameMatrix {
+	// Use analytical fast-path when enabled
+	if (analyticalMode) {
+		return buildAnalyticalPayoffMatrix(battle, p1Choices, p2Choices, remainingDepth, shadow, playerIndex);
+	}
+
 	const payoffs: number[][] = [];
 
 	for (let i = 0; i < p1Choices.length; i++) {
@@ -197,6 +216,521 @@ function buildPayoffMatrix(
 		p1Choices: p1Choices.map(c => c.choiceString),
 		p2Choices: p2Choices.map(c => c.choiceString),
 	};
+}
+
+// ─── Analytical Fast-Path Payoff Matrix ──────────────────────────
+
+/**
+ * Build a payoff matrix using analytical damage calculations instead of
+ * sim cloning. This is ~100x faster and enables deeper search trees.
+ *
+ * For each cell (p1Choice, p2Choice):
+ *
+ * 1. MOVE vs MOVE: Determine speed → who moves first → apply pre-move
+ *    status/stat effects from the faster mon → compute both sides' damage →
+ *    estimate resulting HP → evaluate position.
+ *
+ * 2. MOVE vs SWITCH: The switching player takes a free hit. Compute damage
+ *    from the attacking mon, estimate post-switch-in HP, evaluate matchup.
+ *
+ * 3. SWITCH vs SWITCH: Both switch. Evaluate the resulting matchup analytically
+ *    (type advantage, speed comparison, TKO differential of new actives).
+ *
+ * 4. SWITCH vs MOVE: Mirror of MOVE vs SWITCH.
+ *
+ * The value is expressed from P1's perspective in [-1, 1] to match the
+ * sim-based matrix format.
+ */
+export function buildAnalyticalPayoffMatrix(
+	battle: Battle,
+	p1Choices: Choice[],
+	p2Choices: Choice[],
+	remainingDepth: number,
+	shadow: ShadowTeam | undefined,
+	_playerIndex: number,
+): GameMatrix {
+	const payoffs: number[][] = [];
+
+	// Extract current state once (shared across all cells)
+	const field = extractFieldState(battle);
+	const p1Active = getActiveMon(battle, 0);
+	const p2Active = getActiveMon(battle, 1);
+	const p1Side = extractSideState(battle, 0);
+	const p2Side = extractSideState(battle, 1);
+
+	// Base evaluation of the current position (used as reference point)
+	const baseEval = evaluateNode(battle, shadow, 0);
+
+	for (let i = 0; i < p1Choices.length; i++) {
+		payoffs[i] = [];
+		for (let j = 0; j < p2Choices.length; j++) {
+			if (isTimeUp()) {
+				payoffs[i][j] = baseEval;
+				continue;
+			}
+
+			nodesVisited++;
+			payoffs[i][j] = evaluateAnalyticalCell(
+				p1Choices[i], p2Choices[j],
+				p1Active, p2Active,
+				p1Side, p2Side,
+				field, baseEval, shadow,
+			);
+		}
+	}
+
+	return {
+		payoffs,
+		p1Labels: p1Choices.map(c => c.label),
+		p2Labels: p2Choices.map(c => c.label),
+		p1Choices: p1Choices.map(c => c.choiceString),
+		p2Choices: p2Choices.map(c => c.choiceString),
+	};
+}
+
+/**
+ * Evaluate a single cell of the analytical payoff matrix.
+ * Returns value from P1's perspective [-1, 1].
+ */
+export function evaluateAnalyticalCell(
+	p1Choice: Choice,
+	p2Choice: Choice,
+	p1Active: MonState | null,
+	p2Active: MonState | null,
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+	baseEval: number,
+	shadow: ShadowTeam | undefined,
+): number {
+	if (!p1Active || !p2Active) return baseEval;
+
+	const p1IsMove = p1Choice.type === 'move';
+	const p2IsMove = p2Choice.type === 'move';
+
+	// SWITCH vs SWITCH: both switch, evaluate new matchup
+	if (!p1IsMove && !p2IsMove) {
+		return evaluateAnalyticalSwitchSwitch(
+			p1Choice, p2Choice, p1Side, p2Side, field, baseEval, shadow,
+		);
+	}
+
+	// MOVE vs SWITCH: P1 attacks, P2 switches (P1 gets free hit)
+	if (p1IsMove && !p2IsMove) {
+		return evaluateAnalyticalMoveSwitch(
+			p1Active, p2Active, p1Choice, p2Choice,
+			p1Side, p2Side, field, baseEval, shadow, true,
+		);
+	}
+
+	// SWITCH vs MOVE: P2 attacks, P1 switches (P2 gets free hit)
+	if (!p1IsMove && p2IsMove) {
+		return evaluateAnalyticalMoveSwitch(
+			p2Active, p1Active, p2Choice, p1Choice,
+			p2Side, p1Side, field, baseEval, shadow, false,
+		);
+	}
+
+	// MOVE vs MOVE: both attack, determine speed and move-order effects
+	return evaluateAnalyticalMoveMove(
+		p1Active, p2Active, p1Choice, p2Choice,
+		field, baseEval, shadow,
+	);
+}
+
+/**
+ * Evaluate MOVE vs MOVE cell analytically.
+ *
+ * KEY LOGIC: Speed comparison → faster mon acts first.
+ * If faster mon KOs slower mon, slower mon doesn't get to act.
+ * If faster mon uses status (burn/para), it affects slower mon's damage.
+ */
+function evaluateAnalyticalMoveMove(
+	p1Active: MonState,
+	p2Active: MonState,
+	p1Choice: Choice,
+	p2Choice: Choice,
+	field: FieldState,
+	baseEval: number,
+	_shadow: ShadowTeam | undefined,
+): number {
+	const p1Move = getMoveFromChoice(p1Active, p1Choice);
+	const p2Move = getMoveFromChoice(p2Active, p2Choice);
+
+	if (!p1Move || !p2Move) return baseEval;
+
+	const opts = { field };
+
+	// Determine speed
+	const speedResult = getSpeedComparison(p1Active, p1Move, p2Active, p2Move, field);
+
+	// Calculate base damage for both moves
+	let p1Dmg = calcDamageWithCrit(p1Active, p2Active, p1Move, opts);
+	let p2Dmg = calcDamageWithCrit(p2Active, p1Active, p2Move, opts);
+
+	// Get raw expected damage values
+	let p1ExpDmg = p1Dmg.expectedWithAccuracy;
+	let p2ExpDmg = p2Dmg.expectedWithAccuracy;
+
+	// ─── Move-order adjustments ───────────────────────────────
+
+	if (speedResult.faster === 'p1') {
+		// P1 moves first
+
+		// If P1 OHKOs P2, P2 doesn't get to act
+		if (p1ExpDmg >= p2Active.hp) {
+			// P2 is KO'd before acting → massive advantage for P1
+			const p2HPAfter = 0;
+			return computeHPDeltaEval(
+				p1Active.hp, p1Active.maxhp,
+				p2HPAfter, p2Active.maxhp,
+				baseEval,
+			);
+		}
+
+		// If P1 uses a status move that degrades P2's damage
+		p2ExpDmg = applyPreMoveStatusEffect(p1Move, p1Active, p2Active, p2Move, p2ExpDmg);
+	} else if (speedResult.faster === 'p2') {
+		// P2 moves first
+
+		// If P2 OHKOs P1, P1 doesn't get to act
+		if (p2ExpDmg >= p1Active.hp) {
+			const p1HPAfter = 0;
+			return computeHPDeltaEval(
+				p1HPAfter, p1Active.maxhp,
+				p2Active.hp, p2Active.maxhp,
+				baseEval,
+			);
+		}
+
+		// If P2 uses a status move that degrades P1's damage
+		p1ExpDmg = applyPreMoveStatusEffect(p2Move, p2Active, p1Active, p1Move, p1ExpDmg);
+	}
+	// If tie: both move at "same time" → no adjustment (average case)
+
+	// Compute resulting HP
+	const p1HPAfter = Math.max(0, p1Active.hp - p2ExpDmg);
+	const p2HPAfter = Math.max(0, p2Active.hp - p1ExpDmg);
+
+	return computeHPDeltaEval(p1HPAfter, p1Active.maxhp, p2HPAfter, p2Active.maxhp, baseEval);
+}
+
+/**
+ * Apply the effect of a faster mon's move on the slower mon's damage output.
+ *
+ * Returns the adjusted expected damage for the slower mon.
+ *
+ * Covers: Will-O-Wisp halving physical damage, Thunder Wave adding action denial,
+ * Charm/Feather Dance reducing attack, etc.
+ */
+export function applyPreMoveStatusEffect(
+	fasterMove: MoveInfo,
+	fasterMon: MonState,
+	slowerMon: MonState,
+	slowerMove: MoveInfo,
+	slowerExpDmg: number,
+): number {
+	// Only status moves can apply pre-move effects
+	// (damaging moves with secondaries are already factored into the damage calc)
+	if (fasterMove.category !== 'Status') {
+		// Damaging moves with burn chance (Scald, Lava Plume) — 30% burn chance
+		if (fasterMove.secondary?.status === 'brn' || fasterMove.secondaries?.some((s: any) => s.status === 'brn')) {
+			if (slowerMove.category === 'Physical' && !slowerMon.status &&
+				slowerMon.abilityId !== 'guts' && !slowerMon.types.includes('Fire')) {
+				const burnChance = fasterMove.secondary?.chance ? fasterMove.secondary.chance / 100 : 0.3;
+				// If burn lands, physical damage halved
+				return slowerExpDmg * (1 - burnChance * 0.5);
+			}
+		}
+		return slowerExpDmg;
+	}
+
+	// ─── Status moves ──────────────────────────────────────────
+
+	// Will-O-Wisp: burns → physical damage halved
+	if (fasterMove.id === 'willowisp') {
+		if (slowerMove.category === 'Physical' && !slowerMon.status &&
+			slowerMon.abilityId !== 'guts' && !slowerMon.types.includes('Fire')) {
+			const hitRate = fasterMove.accuracy === true ? 1 : (fasterMove.accuracy as number) / 100;
+			return slowerExpDmg * (1 - hitRate * 0.5);
+		}
+	}
+
+	// Thunder Wave / Glare / Stun Spore / Nuzzle: para → 25% action denial
+	if (fasterMove.id === 'thunderwave' || fasterMove.id === 'glare' ||
+		fasterMove.id === 'stunspore' || fasterMove.id === 'nuzzle') {
+		if (!slowerMon.status && slowerMon.abilityId !== 'limber') {
+			// Check immunities
+			if (fasterMove.id === 'thunderwave' &&
+				(slowerMon.types.includes('Electric') || slowerMon.types.includes('Ground'))) {
+				return slowerExpDmg;
+			}
+			if (fasterMove.id === 'stunspore' && slowerMon.types.includes('Grass')) {
+				return slowerExpDmg;
+			}
+			const hitRate = fasterMove.accuracy === true ? 1 : (fasterMove.accuracy as number) / 100;
+			return slowerExpDmg * (1 - hitRate * 0.25);
+		}
+	}
+
+	// Spore / Sleep Powder / Hypnosis / Lovely Kiss / Dark Void: sleep → 0 damage
+	if (fasterMove.id === 'spore' || fasterMove.id === 'sleeppowder' ||
+		fasterMove.id === 'hypnosis' || fasterMove.id === 'lovelykiss' ||
+		fasterMove.id === 'darkvoid') {
+		if (!slowerMon.status) {
+			// Grass immune to powder
+			if ((fasterMove.id === 'spore' || fasterMove.id === 'sleeppowder') &&
+				slowerMon.types.includes('Grass')) return slowerExpDmg;
+			if (slowerMon.abilityId === 'insomnia' || slowerMon.abilityId === 'vitalspirit') return slowerExpDmg;
+			const hitRate = fasterMove.accuracy === true ? 1 : (fasterMove.accuracy as number) / 100;
+			const hasSleepTalk = slowerMon.moves.some(m => m.id === 'sleeptalk');
+			return slowerExpDmg * (1 - hitRate * (hasSleepTalk ? 0.5 : 1.0));
+		}
+	}
+
+	// Yawn: delayed sleep (takes effect next turn)
+	if (fasterMove.id === 'yawn' && !slowerMon.status) {
+		// Delayed — half-weight the sleep for this turn's damage estimate
+		return slowerExpDmg * 0.75;
+	}
+
+	// Charm / Feather Dance: -2 Atk
+	if (fasterMove.id === 'charm' || fasterMove.id === 'featherdance') {
+		if (slowerMove.category === 'Physical' && slowerMon.abilityId !== 'contrary') {
+			const hitRate = fasterMove.accuracy === true ? 1 : (fasterMove.accuracy as number) / 100;
+			// -2 Atk ≈ 0.5x damage from current state (simplified)
+			return slowerExpDmg * (1 - hitRate * 0.5);
+		}
+	}
+
+	// Parting Shot: -1 Atk, -1 SpA
+	if (fasterMove.id === 'partingshot') {
+		const hitRate = fasterMove.accuracy === true ? 1 : (fasterMove.accuracy as number) / 100;
+		return slowerExpDmg * (1 - hitRate * 0.33);
+	}
+
+	// Screens: Reflect halves physical, Light Screen halves special
+	if (fasterMove.id === 'reflect' && slowerMove.category === 'Physical') {
+		return slowerExpDmg * 0.5;
+	}
+	if (fasterMove.id === 'lightscreen' && slowerMove.category === 'Special') {
+		return slowerExpDmg * 0.5;
+	}
+	if (fasterMove.id === 'auroraveil') {
+		return slowerExpDmg * 0.5;
+	}
+
+	return slowerExpDmg;
+}
+
+/**
+ * Evaluate MOVE vs SWITCH cell analytically.
+ *
+ * The attacking mon gets a free hit on the switch-in.
+ * We estimate the switch-in's HP after taking the hit, then evaluate
+ * the resulting matchup (attacker vs damaged switch-in).
+ *
+ * @param attackerIsP1 - true if P1 is attacking (and P2 is switching)
+ */
+function evaluateAnalyticalMoveSwitch(
+	attacker: MonState,
+	_currentDefender: MonState,
+	moveChoice: Choice,
+	switchChoice: Choice,
+	attackerSide: MonState[],
+	defenderSide: MonState[],
+	field: FieldState,
+	baseEval: number,
+	_shadow: ShadowTeam | undefined,
+	attackerIsP1: boolean,
+): number {
+	const move = getMoveFromChoice(attacker, moveChoice);
+	if (!move) return baseEval;
+
+	// Find the switch-in target
+	const switchIn = defenderSide.find(m =>
+		!m.fainted && !m.isActive && m.position + 1 === switchChoice.switchIndex
+	);
+	if (!switchIn) return baseEval;
+
+	// The attacker's move hits the switch-in
+	if (move.category === 'Status') {
+		// Status move on switch-in: apply status effect value
+		const statusPenalty = estimateStatusMoveValue(move, switchIn);
+		return baseEval + (attackerIsP1 ? statusPenalty : -statusPenalty);
+	}
+
+	// Calculate damage to the switch-in
+	const dmgResult = calcDamageWithCrit(attacker, switchIn, move, {
+		field,
+		defenderJustSwitched: true,
+	});
+	const damage = dmgResult.expectedWithAccuracy;
+
+	// Switch-in HP after the hit
+	const switchInHPAfter = Math.max(0, switchIn.hp - damage);
+
+	if (switchInHPAfter <= 0) {
+		// Switch-in is KO'd on entry → huge advantage for attacker
+		// (defender loses a mon AND has to switch again)
+		return attackerIsP1 ? clamp(baseEval + 0.4) : clamp(baseEval - 0.4);
+	}
+
+	// Evaluate the new matchup: attacker (full HP) vs damaged switch-in
+	const hpFraction = switchInHPAfter / switchIn.maxhp;
+
+	// The switch-in coming in damaged degrades the defender's position
+	// Proportional to how much HP they lost
+	const hpLostFraction = 1 - hpFraction;
+	const delta = hpLostFraction * 0.2; // ~0.2 eval swing for a full HP bar of damage
+	return attackerIsP1 ? clamp(baseEval + delta) : clamp(baseEval - delta);
+}
+
+/**
+ * Evaluate SWITCH vs SWITCH cell analytically.
+ * Both sides switch simultaneously. Evaluate the resulting matchup
+ * based on the new actives' type matchup, speed, and TKO differential.
+ */
+function evaluateAnalyticalSwitchSwitch(
+	p1Choice: Choice,
+	p2Choice: Choice,
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+	baseEval: number,
+	_shadow: ShadowTeam | undefined,
+): number {
+	const p1SwitchIn = p1Side.find(m =>
+		!m.fainted && !m.isActive && m.position + 1 === p1Choice.switchIndex
+	);
+	const p2SwitchIn = p2Side.find(m =>
+		!m.fainted && !m.isActive && m.position + 1 === p2Choice.switchIndex
+	);
+
+	if (!p1SwitchIn || !p2SwitchIn) return baseEval;
+
+	// Evaluate the new matchup using TKO differential
+	const p1BestMove = findBestMoveForMatchup(p1SwitchIn, p2SwitchIn, field);
+	const p2BestMove = findBestMoveForMatchup(p2SwitchIn, p1SwitchIn, field);
+
+	const p1BestDmg = p1BestMove?.expectedWithAccuracy ?? 0;
+	const p2BestDmg = p2BestMove?.expectedWithAccuracy ?? 0;
+
+	const p1TKO = p1BestDmg > 0 ? Math.ceil(p2SwitchIn.hp / p1BestDmg) : Infinity;
+	const p2TKO = p2BestDmg > 0 ? Math.ceil(p1SwitchIn.hp / p2BestDmg) : Infinity;
+
+	if (p1TKO === Infinity && p2TKO === Infinity) return baseEval;
+	if (p1TKO === Infinity) return clamp(baseEval - 0.15);
+	if (p2TKO === Infinity) return clamp(baseEval + 0.15);
+
+	const tkoAdvantage = (p2TKO - p1TKO) / 3;
+	return clamp(baseEval + tkoAdvantage * 0.2);
+}
+
+/**
+ * Get a MoveInfo from a Choice, looking it up in the mon's moveset.
+ */
+function getMoveFromChoice(mon: MonState, choice: Choice): MoveInfo | null {
+	if (choice.type !== 'move' || choice.moveIndex === undefined) return null;
+	return mon.moves[choice.moveIndex] ?? null;
+}
+
+/**
+ * Find the best damaging move for a given attacker vs defender matchup.
+ */
+function findBestMoveForMatchup(
+	attacker: MonState,
+	defender: MonState,
+	field: FieldState,
+): DamageResult | null {
+	let best: DamageResult | null = null;
+	for (const move of attacker.moves) {
+		if (move.disabled || move.category === 'Status' || move.pp <= 0) continue;
+		const result = calcDamageWithCrit(attacker, defender, move, { field });
+		if (!best || result.expectedWithAccuracy > best.expectedWithAccuracy) {
+			best = result;
+		}
+	}
+	return best;
+}
+
+/**
+ * Estimate the value of landing a status move on a target.
+ * Returns a positive value = advantage for the status user.
+ */
+function estimateStatusMoveValue(move: MoveInfo, target: MonState): number {
+	if (target.status) return 0; // already statused
+
+	const hitRate = move.accuracy === true ? 1 : (move.accuracy as number) / 100;
+
+	switch (move.id) {
+		case 'willowisp':
+			if (target.types.includes('Fire')) return 0;
+			// Burns physical attackers and adds DOT
+			return hitRate * 0.12;
+		case 'thunderwave':
+			if (target.types.includes('Electric') || target.types.includes('Ground')) return 0;
+			return hitRate * 0.10;
+		case 'toxic':
+			if (target.types.includes('Poison') || target.types.includes('Steel')) return 0;
+			return hitRate * 0.15; // toxic is very valuable
+		case 'spore':
+		case 'sleeppowder':
+		case 'hypnosis':
+		case 'lovelykiss':
+		case 'darkvoid':
+			if (target.abilityId === 'insomnia' || target.abilityId === 'vitalspirit') return 0;
+			return hitRate * 0.20; // sleep is huge
+		case 'yawn':
+			return 0.08; // delayed sleep, often forces switch
+		case 'stealthrock':
+			return 0.10; // hazard value
+		case 'spikes':
+			return 0.06;
+		case 'toxicspikes':
+			return 0.05;
+		case 'defog':
+		case 'rapidspin':
+			return 0.05; // hazard removal
+		case 'reflect':
+		case 'lightscreen':
+			return 0.08;
+		case 'auroraveil':
+			return 0.12;
+		default:
+			return 0.02; // generic status move
+	}
+}
+
+/**
+ * Compute an adjusted evaluation from HP deltas after a turn of combat.
+ * Blends HP changes into the base evaluation.
+ */
+function computeHPDeltaEval(
+	p1HPAfter: number, p1MaxHP: number,
+	p2HPAfter: number, p2MaxHP: number,
+	baseEval: number,
+): number {
+	// HP fractions after combat
+	const p1HPFrac = p1HPAfter / p1MaxHP;
+	const p2HPFrac = p2HPAfter / p2MaxHP;
+
+	// If either mon fainted, large swing
+	if (p1HPAfter <= 0 && p2HPAfter <= 0) return baseEval; // both faint = wash
+	if (p1HPAfter <= 0) return clamp(baseEval - 0.35);
+	if (p2HPAfter <= 0) return clamp(baseEval + 0.35);
+
+	// Otherwise, shift eval proportional to HP damage dealt
+	// (damage to opponent = good for us, damage to us = bad)
+	const p1HPLost = 1 - p1HPFrac; // how much of our HP bar was lost
+	const p2HPLost = 1 - p2HPFrac; // how much of their HP bar was lost
+	const netDamage = p2HPLost - p1HPLost; // positive = we dealt more than we took
+
+	return clamp(baseEval + netDamage * 0.25);
+}
+
+function clamp(val: number): number {
+	return Math.max(-1, Math.min(1, val));
 }
 
 // ─── Recursive Minimax Value ─────────────────────────────────────

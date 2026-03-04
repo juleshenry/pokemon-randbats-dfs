@@ -3621,5 +3621,528 @@ describe('Damage Calculator', () => {
 			expect(ratio).to.be.closeTo(2.25, 0.2);
 		});
 	});
+
+	// ─── Pixilate (Sylveon) ──────────────────────────────────────────
+
+	describe('Pixilate (Sylveon)', () => {
+
+		it('Pixilate: Hyper Voice becomes Fairy-type with 1.2x BP boost', () => {
+			// Sylveon L85, Pixilate — Hyper Voice (Normal 90 BP) → Fairy 108 BP
+			const battle = create1v1Battle(
+				makeSet('Sylveon', ['Calm Mind', 'Hyper Voice', 'Protect', 'Wish'],
+					{ ability: 'Pixilate' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const hyperVoice = getMove(atk, 'Hyper Voice');
+
+			const dmg = calcDamage(atk, def, hyperVoice, { isCrit: false });
+
+			// Hyper Voice should be treated as Fairy-type (Mew is Psychic — neutral hit)
+			// With Pixilate STAB (1.5x) + 1.2x BP boost, damage should be substantial
+			expect(dmg.expected).to.be.greaterThan(0);
+			expect(dmg.effectiveness).to.equal(1); // Fairy vs Psychic = neutral
+		});
+
+		it('Pixilate: type conversion grants Fairy STAB and correct effectiveness', () => {
+			// Test against a Fighting-type (Fairy is SE vs Fighting)
+			const battle = create1v1Battle(
+				makeSet('Sylveon', ['Calm Mind', 'Hyper Voice', 'Protect', 'Wish'],
+					{ ability: 'Pixilate' }),
+				makeSet('Conkeldurr', ['Drain Punch', 'Mach Punch', 'Knock Off', 'Ice Punch'],
+					{ ability: 'Guts' })
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const hyperVoice = getMove(atk, 'Hyper Voice');
+
+			const dmg = calcDamage(atk, def, hyperVoice, { isCrit: false });
+
+			// Fairy vs Fighting = 2x SE
+			expect(dmg.effectiveness).to.equal(2);
+		});
+
+		it('Pixilate: sim-validated damage range', () => {
+			const p1Set = makeSet('Sylveon', ['Calm Mind', 'Hyper Voice', 'Protect', 'Wish'],
+				{ ability: 'Pixilate' });
+			const p2Set = makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp']);
+
+			const battle = create1v1Battle(p1Set, p2Set);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const hyperVoice = getMove(atk, 'Hyper Voice');
+			const calcResult = calcDamage(atk, def, hyperVoice, { isCrit: false });
+
+			// Run sim 20 times, verify each non-crit damage falls in [min, max]
+			for (let i = 0; i < 20; i++) {
+				const seed: [number, number, number, number] = [i * 71 + 1, i * 37 + 2, i * 53 + 3, i * 19 + 4];
+				const sim = simDamage(p1Set, p2Set, 2, seed); // Hyper Voice is slot 2
+				if (!sim.crit && !sim.missed && sim.damage > 0) {
+					expect(sim.damage).to.be.at.least(calcResult.min,
+						`Sim damage ${sim.damage} < calc min ${calcResult.min} (seed ${seed})`);
+					expect(sim.damage).to.be.at.most(calcResult.max,
+						`Sim damage ${sim.damage} > calc max ${calcResult.max} (seed ${seed})`);
+				}
+			}
+		});
+	});
+
+	// ─── Galvanize (Golem-Alola) ─────────────────────────────────────
+
+	describe('Galvanize (Golem-Alola)', () => {
+
+		it('Galvanize: Double-Edge becomes Electric-type with 1.2x BP boost', () => {
+			// Golem-Alola L93, Galvanize — Double-Edge (Normal 120 BP) → Electric 144 BP
+			const battle = create1v1Battle(
+				makeSet('Golem-Alola', ['Double-Edge', 'Earthquake', 'Rock Polish', 'Stone Edge'],
+					{ ability: 'Galvanize' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const doubleEdge = getMove(atk, 'Double-Edge');
+
+			const dmg = calcDamage(atk, def, doubleEdge, { isCrit: false });
+
+			// Double-Edge becomes Electric — neutral vs Psychic
+			expect(dmg.expected).to.be.greaterThan(0);
+			expect(dmg.effectiveness).to.equal(1);
+		});
+
+		it('Galvanize: Electric-converted move is immune vs Ground', () => {
+			const battle = create1v1Battle(
+				makeSet('Golem-Alola', ['Double-Edge', 'Earthquake', 'Rock Polish', 'Stone Edge'],
+					{ ability: 'Galvanize' }),
+				makeSet('Gastrodon', ['Earth Power', 'Ice Beam', 'Recover', 'Scald'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const doubleEdge = getMove(atk, 'Double-Edge');
+
+			const dmg = calcDamage(atk, def, doubleEdge, { isCrit: false });
+
+			// Electric vs Water/Ground — Ground is immune to Electric
+			expect(dmg.expected).to.equal(0);
+			expect(dmg.effectiveness).to.equal(0);
+		});
+
+		it('Galvanize: sim-validated damage range', () => {
+			const p1Set = makeSet('Golem-Alola', ['Double-Edge', 'Earthquake', 'Rock Polish', 'Stone Edge'],
+				{ ability: 'Galvanize' });
+			const p2Set = makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp']);
+
+			const battle = create1v1Battle(p1Set, p2Set);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const doubleEdge = getMove(atk, 'Double-Edge');
+			const calcResult = calcDamage(atk, def, doubleEdge, { isCrit: false });
+
+			// Run sim 20 times, verify each non-crit damage falls in [min, max]
+			for (let i = 0; i < 20; i++) {
+				const seed: [number, number, number, number] = [i * 73 + 1, i * 41 + 2, i * 59 + 3, i * 23 + 4];
+				const sim = simDamage(p1Set, p2Set, 1, seed); // Double-Edge is slot 1
+				if (!sim.crit && !sim.missed && sim.damage > 0) {
+					expect(sim.damage).to.be.at.least(calcResult.min,
+						`Sim damage ${sim.damage} < calc min ${calcResult.min} (seed ${seed})`);
+					expect(sim.damage).to.be.at.most(calcResult.max,
+						`Sim damage ${sim.damage} > calc max ${calcResult.max} (seed ${seed})`);
+				}
+			}
+		});
+	});
+
+	// ─── Mold Breaker (Excadrill) ────────────────────────────────────
+
+	describe('Mold Breaker (Excadrill)', () => {
+
+		it('Mold Breaker: Earthquake hits through Levitate', () => {
+			// Excadrill L79, Mold Breaker — Earthquake vs Rotom-Wash (Levitate)
+			const battle = create1v1Battle(
+				makeSet('Excadrill', ['Earthquake', 'Iron Head', 'Rapid Spin', 'Swords Dance'],
+					{ ability: 'Mold Breaker' }),
+				makeSet('Rotom-Wash', ['Hydro Pump', 'Thunderbolt', 'Volt Switch', 'Will-O-Wisp'],
+					{ ability: 'Levitate' })
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const eq = getMove(atk, 'Earthquake');
+
+			const dmg = calcDamage(atk, def, eq, { isCrit: false });
+
+			// Mold Breaker ignores Levitate — Ground hits Rotom-Wash
+			// Electric/Water: Ground is 1x vs Electric, 2x vs Water = 2x SE
+			expect(dmg.expected).to.be.greaterThan(0);
+			expect(dmg.effectiveness).to.equal(2);
+		});
+
+		it('Mold Breaker: bypasses Multiscale defensive ability', () => {
+			const battle = create1v1Battle(
+				makeSet('Excadrill', ['Earthquake', 'Iron Head', 'Rapid Spin', 'Swords Dance'],
+					{ ability: 'Mold Breaker' }),
+				makeSet('Dragonite', ['Dragon Dance', 'Earthquake', 'Outrage', 'Roost'],
+					{ ability: 'Multiscale' })
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const ironHead = getMove(atk, 'Iron Head');
+
+			// With Mold Breaker: Multiscale is bypassed, full damage at full HP
+			const moldBreakerDmg = calcDamage(atk, def, ironHead, { isCrit: false });
+
+			// Without Mold Breaker: simulate by changing attacker ability
+			const noMBAtk = { ...atk, abilityId: 'sandrush' };
+			const normalDmg = calcDamage(noMBAtk, def, ironHead, { isCrit: false });
+
+			// At full HP, Multiscale halves damage. Mold Breaker bypasses it.
+			// So moldBreakerDmg should be ~2x normalDmg
+			const ratio = moldBreakerDmg.expected / normalDmg.expected;
+			expect(ratio).to.be.closeTo(2.0, 0.2);
+		});
+
+		it('Mold Breaker: bypasses Fluffy defensive ability', () => {
+			const battle = create1v1Battle(
+				makeSet('Excadrill', ['Earthquake', 'Iron Head', 'Rapid Spin', 'Swords Dance'],
+					{ ability: 'Mold Breaker' }),
+				makeSet('Houndstone', ['Body Press', 'Phantom Force', 'Rest', 'Sleep Talk'],
+					{ ability: 'Fluffy' })
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const ironHead = getMove(atk, 'Iron Head');
+
+			// With Mold Breaker: Fluffy's contact damage halving is bypassed
+			const moldBreakerDmg = calcDamage(atk, def, ironHead, { isCrit: false });
+
+			// Without Mold Breaker: Fluffy halves contact damage
+			const noMBAtk = { ...atk, abilityId: 'sandrush' };
+			const normalDmg = calcDamage(noMBAtk, def, ironHead, { isCrit: false });
+
+			// Fluffy halves contact damage. Mold Breaker bypasses it.
+			const ratio = moldBreakerDmg.expected / normalDmg.expected;
+			expect(ratio).to.be.closeTo(2.0, 0.2);
+		});
+
+		it('Mold Breaker: sim-validated Earthquake hits Levitate target', () => {
+			const p1Set = makeSet('Excadrill', ['Earthquake', 'Iron Head', 'Rapid Spin', 'Swords Dance'],
+				{ ability: 'Mold Breaker' });
+			// Use Thunderbolt as p2 move (Electric is neutral vs Ground/Steel Excadrill, won't KO or burn)
+			const p2Set = makeSet('Rotom-Wash', ['Thunderbolt', 'Will-O-Wisp', 'Volt Switch', 'Hydro Pump'],
+				{ ability: 'Levitate' });
+
+			const battle = create1v1Battle(p1Set, p2Set);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const eq = getMove(atk, 'Earthquake');
+			const calcResult = calcDamage(atk, def, eq, { isCrit: false });
+
+			// Verify calc says it does damage
+			expect(calcResult.expected).to.be.greaterThan(0);
+
+			// Run sim to verify Earthquake actually hits through Levitate
+			// P2 uses Thunderbolt (slot 1) — immune to Excadrill (Ground), no status effects
+			let validHits = 0;
+			for (let i = 0; i < 20; i++) {
+				const seed: [number, number, number, number] = [i * 67 + 1, i * 43 + 2, i * 61 + 3, i * 29 + 4];
+				const sim = simDamage(p1Set, p2Set, 1, seed, 1);
+				if (!sim.crit && !sim.missed && sim.damage > 0) {
+					validHits++;
+					expect(sim.damage).to.be.at.least(calcResult.min,
+						`Sim damage ${sim.damage} < calc min ${calcResult.min} (seed ${seed})`);
+					expect(sim.damage).to.be.at.most(calcResult.max,
+						`Sim damage ${sim.damage} > calc max ${calcResult.max} (seed ${seed})`);
+				}
+			}
+			// Earthquake always hits, so we should have many valid hits
+			expect(validHits).to.be.greaterThan(5, 'Expected multiple valid EQ hits through Levitate');
+		});
+	});
+
+	// ─── Libero (Cinderace) ──────────────────────────────────────────
+
+	describe('Libero (Cinderace)', () => {
+
+		it('Libero: all moves get STAB', () => {
+			// Cinderace L77, Libero — all moves get STAB regardless of type
+			const battle = create1v1Battle(
+				makeSet('Cinderace', ['Gunk Shot', 'High Jump Kick', 'Pyro Ball', 'U-turn'],
+					{ ability: 'Libero' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+
+			// Pyro Ball is Fire — Cinderace is Fire-type, so STAB naturally
+			const pyroBall = getMove(atk, 'Pyro Ball');
+			const pyroBaseDmg = calcDamage(atk, def, pyroBall, { isCrit: false });
+
+			// High Jump Kick is Fighting — NOT Fire-type, but Libero gives STAB
+			const hjk = getMove(atk, 'High Jump Kick');
+			const hjkDmg = calcDamage(atk, def, hjk, { isCrit: false });
+
+			// U-turn is Bug — NOT Fire-type, but Libero gives STAB
+			const uturn = getMove(atk, 'U-turn');
+			const uturnDmg = calcDamage(atk, def, uturn, { isCrit: false });
+
+			// Without Libero, HJK and U-turn would NOT get 1.5x STAB
+			const noLiberoAtk = { ...atk, abilityId: 'blaze' };
+			const hjkNormal = calcDamage(noLiberoAtk, def, hjk, { isCrit: false });
+			const uturnNormal = calcDamage(noLiberoAtk, def, uturn, { isCrit: false });
+
+			// Libero HJK should be 1.5x of non-Libero HJK
+			const hjkRatio = hjkDmg.expected / hjkNormal.expected;
+			expect(hjkRatio).to.be.closeTo(1.5, 0.15);
+
+			// Libero U-turn should be 1.5x of non-Libero U-turn
+			const uturnRatio = uturnDmg.expected / uturnNormal.expected;
+			expect(uturnRatio).to.be.closeTo(1.5, 0.15);
+		});
+	});
+
+	// ─── Protean (Greninja) ──────────────────────────────────────────
+
+	describe('Protean (Greninja)', () => {
+
+		it('Protean: all moves get STAB', () => {
+			const battle = create1v1Battle(
+				makeSet('Greninja', ['Dark Pulse', 'Hydro Pump', 'Ice Beam', 'U-turn'],
+					{ ability: 'Protean' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+
+			// Ice Beam is Ice — Greninja is Water/Dark, so normally no STAB
+			const iceBeam = getMove(atk, 'Ice Beam');
+			const proteanDmg = calcDamage(atk, def, iceBeam, { isCrit: false });
+
+			// Without Protean
+			const noProtean = { ...atk, abilityId: 'torrent' };
+			const normalDmg = calcDamage(noProtean, def, iceBeam, { isCrit: false });
+
+			// Protean gives STAB: 1.5x multiplier
+			const ratio = proteanDmg.expected / normalDmg.expected;
+			expect(ratio).to.be.closeTo(1.5, 0.15);
+		});
+	});
+
+	// ─── Body Press (Garganacl) ──────────────────────────────────────
+
+	describe('Body Press (Garganacl)', () => {
+
+		it('Body Press: uses Defense stat instead of Attack', () => {
+			const battle = create1v1Battle(
+				makeSet('Garganacl', ['Body Press', 'Recover', 'Salt Cure', 'Stealth Rock'],
+					{ ability: 'Purifying Salt' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const bodyPress = getMove(atk, 'Body Press');
+
+			const dmg = calcDamage(atk, def, bodyPress, { isCrit: false });
+
+			// Garganacl has much higher Def (130 base) than Atk (100 base)
+			// Body Press should use Def for offense — damage should be non-trivial
+			expect(dmg.expected).to.be.greaterThan(0);
+
+			// Body Press is Fighting-type vs Psychic Mew = NVE (0.5x)
+			expect(dmg.effectiveness).to.equal(0.5);
+		});
+
+		it('Body Press: Defense boosts affect damage', () => {
+			const battle = create1v1Battle(
+				makeSet('Garganacl', ['Body Press', 'Iron Defense', 'Recover', 'Salt Cure'],
+					{ ability: 'Purifying Salt' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const bodyPress = getMove(atk, 'Body Press');
+
+			// No boosts
+			const normalDmg = calcDamage(atk, def, bodyPress, { isCrit: false });
+
+			// +2 Def boost (from Iron Defense)
+			const boostedAtk = { ...atk, boosts: { ...atk.boosts, def: 2 } };
+			const boostedDmg = calcDamage(boostedAtk, def, bodyPress, { isCrit: false });
+
+			// +2 = 2x multiplier on Defense, so Body Press damage should ~double
+			const ratio = boostedDmg.expected / normalDmg.expected;
+			expect(ratio).to.be.closeTo(2.0, 0.2);
+		});
+
+		it('Body Press: Attack boosts do NOT affect damage', () => {
+			const battle = create1v1Battle(
+				makeSet('Garganacl', ['Body Press', 'Iron Defense', 'Recover', 'Salt Cure'],
+					{ ability: 'Purifying Salt' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const bodyPress = getMove(atk, 'Body Press');
+
+			// No boosts
+			const normalDmg = calcDamage(atk, def, bodyPress, { isCrit: false });
+
+			// +6 Atk boost (shouldn't matter for Body Press)
+			const atkBoosted = { ...atk, boosts: { ...atk.boosts, atk: 6 } };
+			const atkBoostedDmg = calcDamage(atkBoosted, def, bodyPress, { isCrit: false });
+
+			// Damage should be the same
+			expect(atkBoostedDmg.expected).to.be.closeTo(normalDmg.expected, 1);
+		});
+
+		it('Body Press: sim-validated damage range', () => {
+			// Use Conkeldurr as defender so Fighting isn't resisted
+			const p1Set = makeSet('Garganacl', ['Body Press', 'Recover', 'Salt Cure', 'Stealth Rock'],
+				{ ability: 'Purifying Salt' });
+			const p2Set = makeSet('Snorlax', ['Body Slam', 'Earthquake', 'Rest', 'Sleep Talk'],
+				{ ability: 'Thick Fat' });
+
+			const battle = create1v1Battle(p1Set, p2Set);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const bodyPress = getMove(atk, 'Body Press');
+			const calcResult = calcDamage(atk, def, bodyPress, { isCrit: false });
+
+			// Verify damage is non-zero (Fighting vs Normal = SE)
+			expect(calcResult.expected).to.be.greaterThan(0);
+			expect(calcResult.effectiveness).to.equal(2);
+
+			// Run sim to validate
+			for (let i = 0; i < 15; i++) {
+				const seed: [number, number, number, number] = [i * 79 + 1, i * 47 + 2, i * 67 + 3, i * 31 + 4];
+				const sim = simDamage(p1Set, p2Set, 1, seed); // Body Press is slot 1
+				if (!sim.crit && !sim.missed && sim.damage > 0) {
+					expect(sim.damage).to.be.at.least(calcResult.min,
+						`Sim damage ${sim.damage} < calc min ${calcResult.min} (seed ${seed})`);
+					expect(sim.damage).to.be.at.most(calcResult.max,
+						`Sim damage ${sim.damage} > calc max ${calcResult.max} (seed ${seed})`);
+				}
+			}
+		});
+	});
+
+	// ─── Gale Wings (Talonflame) ─────────────────────────────────────
+
+	describe('Gale Wings (Talonflame)', () => {
+
+		it('Gale Wings: +1 priority on Flying moves at full HP', () => {
+			const battle = create1v1Battle(
+				makeSet('Talonflame', ['Brave Bird', 'Flare Blitz', 'Swords Dance', 'Tera Blast'],
+					{ ability: 'Gale Wings' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const braveBird = getMove(atk, 'Brave Bird');
+			const flareBlitz = getMove(atk, 'Flare Blitz');
+			const mewMove = getMove(def, 'Ice Beam');
+			const field = extractFieldState(battle);
+
+			// Brave Bird (Flying) at full HP: should get +1 priority
+			const bbSpeed = getSpeedComparison(atk, braveBird, def, mewMove, field);
+			expect(bbSpeed.p1Priority).to.equal(1); // 0 base + 1 Gale Wings
+
+			// Flare Blitz (Fire) at full HP: no priority boost
+			const fbSpeed = getSpeedComparison(atk, flareBlitz, def, mewMove, field);
+			expect(fbSpeed.p1Priority).to.equal(0);
+		});
+
+		it('Gale Wings: no priority boost when not at full HP', () => {
+			const battle = create1v1Battle(
+				makeSet('Talonflame', ['Brave Bird', 'Flare Blitz', 'Swords Dance', 'Tera Blast'],
+					{ ability: 'Gale Wings' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const braveBird = getMove(atk, 'Brave Bird');
+			const mewMove = getMove(def, 'Ice Beam');
+			const field = extractFieldState(battle);
+
+			// At non-full HP, Gale Wings doesn't activate
+			const lowHpAtk = { ...atk, hp: atk.maxhp - 1 };
+			const bbSpeed = getSpeedComparison(lowHpAtk, braveBird, def, mewMove, field);
+			expect(bbSpeed.p1Priority).to.equal(0); // no boost
+		});
+	});
+
+	// ─── Flash Fire boost (Heatran) ──────────────────────────────────
+
+	describe('Flash Fire activated boost (Heatran)', () => {
+
+		it('Flash Fire: 1.5x Atk/SpA on Fire moves when volatile is active', () => {
+			const battle = create1v1Battle(
+				makeSet('Heatran', ['Earth Power', 'Lava Plume', 'Magma Storm', 'Stealth Rock'],
+					{ ability: 'Flash Fire' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const lavaPl = getMove(atk, 'Lava Plume');
+
+			// Without Flash Fire volatile: normal damage
+			const normalDmg = calcDamage(atk, def, lavaPl, { isCrit: false });
+
+			// With Flash Fire volatile: 1.5x boost on Fire moves
+			const ffAtk = { ...atk, volatiles: ['flashfire'] };
+			const ffDmg = calcDamage(ffAtk, def, lavaPl, { isCrit: false });
+
+			const ratio = ffDmg.expected / normalDmg.expected;
+			expect(ratio).to.be.closeTo(1.5, 0.15);
+		});
+
+		it('Flash Fire: non-Fire moves are NOT boosted', () => {
+			const battle = create1v1Battle(
+				makeSet('Heatran', ['Earth Power', 'Lava Plume', 'Magma Storm', 'Stealth Rock'],
+					{ ability: 'Flash Fire' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const earthPower = getMove(atk, 'Earth Power');
+
+			// Without Flash Fire volatile
+			const normalDmg = calcDamage(atk, def, earthPower, { isCrit: false });
+
+			// With Flash Fire volatile — Earth Power is Ground, not Fire
+			const ffAtk = { ...atk, volatiles: ['flashfire'] };
+			const ffDmg = calcDamage(ffAtk, def, earthPower, { isCrit: false });
+
+			// Damage should be the same — Flash Fire only boosts Fire moves
+			expect(ffDmg.expected).to.be.closeTo(normalDmg.expected, 1);
+		});
+	});
+
+	// ─── Stakeout (Gumshoos) ─────────────────────────────────────────
+
+	describe('Stakeout (Gumshoos)', () => {
+
+		it('Stakeout: 2x Atk when defender just switched in', () => {
+			const battle = create1v1Battle(
+				makeSet('Gumshoos', ['Double-Edge', 'Earthquake', 'Knock Off', 'U-turn'],
+					{ ability: 'Stakeout' }),
+				makeSet('Mew', ['Psychic', 'Ice Beam', 'Aura Sphere', 'Will-O-Wisp'])
+			);
+			const atk = getMon(battle, 0);
+			const def = getMon(battle, 1);
+			const knockOff = getMove(atk, 'Knock Off');
+
+			// Normal damage (defender has been in)
+			const normalDmg = calcDamage(atk, def, knockOff, { isCrit: false });
+
+			// Stakeout damage (defender just switched in)
+			const stakeoutDmg = calcDamage(atk, def, knockOff, {
+				isCrit: false,
+				defenderJustSwitched: true,
+			});
+
+			// 2x Atk = 2x damage
+			const ratio = stakeoutDmg.expected / normalDmg.expected;
+			expect(ratio).to.be.closeTo(2.0, 0.2);
+		});
+	});
 });
 

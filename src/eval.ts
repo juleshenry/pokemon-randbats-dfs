@@ -15,12 +15,15 @@
  */
 
 import type {
-	Battle, MonState, FieldState, ShadowTeam,
+	Battle, MonState, FieldState, ShadowTeam, DamageResult, MoveInfo,
 } from './types';
 import {
 	extractFieldState, extractSideState, getActiveMon, isTerminal, getWinValue,
 } from './state';
-import { calcDamageWithCrit, getEffectiveSpeed, calcAllMoves } from './damage-calc';
+import {
+	calcDamageWithCrit, getEffectiveSpeed, calcAllMoves,
+	getSpeedComparison,
+} from './damage-calc';
 
 // ─── Weight Constants ───────────────────────────────────────────
 
@@ -116,11 +119,17 @@ function evaluateCount(p1Mons: MonState[], p2Mons: MonState[]): number {
 }
 
 /**
- * Active matchup: turns-to-KO differential.
+ * Active matchup: turns-to-KO differential with move-order awareness.
  * Positive if P1 KOs P2 faster than P2 KOs P1.
  *
+ * KEY MOVE-ORDER EFFECTS:
+ * - If opponent moves first and uses a status move (burn, para, etc.), our
+ *   damage output is affected BEFORE we attack. The TKO must reflect this.
+ * - If we move first and OHKO, the opponent's action is irrelevant.
+ * - Status moves that degrade the opponent's stats (Intimidate switch-in,
+ *   stat-lowering moves) are modeled as damage multipliers.
+ *
  * Uses the analytical damage calculator's expectedWithCrit for fast estimation.
- * Accounts for status conditions that affect action (sleep, freeze, paralysis).
  */
 function evaluateMatchup(
 	p1Active: MonState | null,
@@ -129,58 +138,261 @@ function evaluateMatchup(
 ): number {
 	if (!p1Active || !p2Active) return 0;
 
-	// Best move damage from each side
 	const opts = { field };
+
+	// Determine who goes first using best move priorities
+	const p1BestMove = findBestDamagingMove(p1Active);
+	const p2BestMove = findBestDamagingMove(p2Active);
+	const speedResult = getSpeedComparison(
+		p1Active, p1BestMove,
+		p2Active, p2BestMove,
+		field,
+	);
+	const p1GoesFirst = speedResult.faster === 'p1';
+	const p2GoesFirst = speedResult.faster === 'p2';
+
+	// Compute base damage from each side (best attacking move)
 	const p1Moves = calcAllMoves(p1Active, p2Active, opts);
 	const p2Moves = calcAllMoves(p2Active, p1Active, opts);
 
 	let p1BestDmg = p1Moves.length > 0 ? p1Moves[0].expectedWithCrit : 0;
 	let p2BestDmg = p2Moves.length > 0 ? p2Moves[0].expectedWithCrit : 0;
 
-	// Status action denial / discount:
-	// Sleep: can't attack unless using Sleep Talk. Approximate as 0 damage.
-	// Freeze: can't attack (20% thaw chance per turn, but unreliable). Approximate as 0.
-	// Paralysis: 25% chance of full paralysis per turn → multiply damage by 0.75.
+	// Apply existing status conditions (sleep, freeze, paralysis action denial)
 	p1BestDmg *= getStatusDamageMultiplier(p1Active);
 	p2BestDmg *= getStatusDamageMultiplier(p2Active);
 
+	// ─── Move-Order Effect: Pre-move status threats ──────────────
+	// Check if the FASTER mon can inflict a status that degrades the
+	// slower mon's damage output. This is the key move-order insight:
+	// if the opponent is faster and has Will-O-Wisp, our physical damage
+	// is halved starting turn 1.
+
+	if (p2GoesFirst) {
+		// Opponent moves first: check if they have status moves that hurt us
+		const p1DmgAdjust = getMoveOrderDamageAdjustment(p2Active, p1Active, p1Moves);
+		p1BestDmg *= p1DmgAdjust;
+	}
+	if (p1GoesFirst) {
+		// We move first: check if we have status moves that hurt them
+		const p2DmgAdjust = getMoveOrderDamageAdjustment(p1Active, p2Active, p2Moves);
+		p2BestDmg *= p2DmgAdjust;
+	}
+
 	// Residual damage per turn on the DEFENDER (helps the attacker's TKO)
-	// Burn: 1/16 maxhp per turn. Poison: 1/8 maxhp. Toxic: escalates (avg ~1/8).
 	const p2Residual = getResidualDamagePerTurn(p2Active);
 	const p1Residual = getResidualDamagePerTurn(p1Active);
 
+	// Move-order status may ALSO add new residual damage (burn DOT, toxic, etc.)
+	const p1NewResidual = p2GoesFirst ? getPreMoveStatusResidual(p2Active, p1Active) : 0;
+	const p2NewResidual = p1GoesFirst ? getPreMoveStatusResidual(p1Active, p2Active) : 0;
+
 	// Effective damage per turn = move damage + residual on defender
-	const p1EffDmg = p1BestDmg + p2Residual;
-	const p2EffDmg = p2BestDmg + p1Residual;
+	const p1EffDmg = p1BestDmg + p2Residual + p2NewResidual;
+	const p2EffDmg = p2BestDmg + p1Residual + p1NewResidual;
 
 	// Turns to KO (using effective damage per turn vs remaining HP)
 	const p1TKO = p1EffDmg > 0 ? Math.ceil(p2Active.hp / p1EffDmg) : Infinity;
 	const p2TKO = p2EffDmg > 0 ? Math.ceil(p1Active.hp / p2EffDmg) : Infinity;
 
-	// Speed determines who attacks first
-	const p1Speed = getEffectiveSpeed(p1Active, field);
-	const p2Speed = getEffectiveSpeed(p2Active, field);
+	// ─── Move-Order Effect: OHKO-before-action ───────────────────
+	// If we move first and OHKO, opponent's action is irrelevant → pure win
+	if (p1GoesFirst && p1BestDmg >= p2Active.hp) {
+		return 1.0; // We OHKO before opponent acts
+	}
+	if (p2GoesFirst && p2BestDmg >= p1Active.hp) {
+		return -1.0; // Opponent OHKOs us before we act
+	}
 
-	// Priority consideration
-	const p1Priority = p1Moves.length > 0 ? (p1Moves[0].moveName ? getPriority(p1Active, p1Moves[0].moveName) : 0) : 0;
-	const p2Priority = p2Moves.length > 0 ? (p2Moves[0].moveName ? getPriority(p2Active, p2Moves[0].moveName) : 0) : 0;
+	// Convert TKO differential to [-1, 1]
+	if (p1TKO === Infinity && p2TKO === Infinity) return 0;
+	if (p1TKO === Infinity) return -0.8;
+	if (p2TKO === Infinity) return 0.8;
 
-	const p1GoesFirst = p1Priority > p2Priority || (p1Priority === p2Priority && p1Speed > p2Speed);
-
-	// Convert TKO differential to [-1, 1] using sigmoid-like function
-	if (p1TKO === Infinity && p2TKO === Infinity) return 0; // neither can KO
-	if (p1TKO === Infinity) return -0.8; // P1 can't KO, P2 can
-	if (p2TKO === Infinity) return 0.8;  // P1 can KO, P2 can't
-
-	// TKO advantage: negative means P1 KOs faster
+	// TKO advantage: positive means P1 KOs faster
 	let tkoAdvantage = p2TKO - p1TKO;
 
-	// Speed bonus: going first matters most when TKO is close
+	// Speed bonus: going first matters most when TKO counts are equal
+	// The faster player wins the "same TKO" race
 	if (p1GoesFirst && p1TKO <= p2TKO) tkoAdvantage += 0.5;
-	if (!p1GoesFirst && p2TKO <= p1TKO) tkoAdvantage -= 0.5;
+	if (p2GoesFirst && p2TKO <= p1TKO) tkoAdvantage -= 0.5;
 
 	// Map to [-1, 1] using tanh-like clamping
 	return Math.max(-1, Math.min(1, tkoAdvantage / 3));
+}
+
+/**
+ * Find the best damaging move from a mon's moveset (for speed comparison).
+ * Returns null if no damaging moves.
+ */
+function findBestDamagingMove(mon: MonState): MoveInfo | null {
+	let best: MoveInfo | null = null;
+	let bestBP = 0;
+	for (const m of mon.moves) {
+		if (m.disabled || m.category === 'Status' || m.pp <= 0) continue;
+		if (m.basePower > bestBP) {
+			bestBP = m.basePower;
+			best = m;
+		}
+	}
+	return best;
+}
+
+/**
+ * Calculate a damage multiplier [0, 1] reflecting how much the faster mon's
+ * status moves degrade the slower mon's damage output.
+ *
+ * Key scenarios:
+ * - Will-O-Wisp on a physical attacker → 0.5x damage (burn halves physical)
+ * - Thunder Wave on a fast sweeper → 0.75x (para action denial) + speed halved
+ * - Strength Sap / stat-lowering → modest reduction
+ *
+ * We look at what the faster mon COULD use (their moveset) and whether it
+ * would actually affect the slower mon's best attack.
+ */
+function getMoveOrderDamageAdjustment(
+	fasterMon: MonState,
+	slowerMon: MonState,
+	slowerMoves: DamageResult[],
+): number {
+	// If slower mon already has the status, no further degradation
+	if (slowerMon.status) return 1.0;
+
+	// Check if slower mon's best attack is physical or special
+	const bestAttack = slowerMoves.length > 0 ? slowerMoves[0] : null;
+	const isPhysicalAttacker = bestAttack
+		? slowerMon.moves.find(m => m.name === bestAttack.moveName)?.category === 'Physical'
+		: false;
+
+	let multiplier = 1.0;
+
+	for (const move of fasterMon.moves) {
+		if (move.disabled || move.pp <= 0) continue;
+
+		// Will-O-Wisp: burns physical attackers → 0.5x physical damage
+		if (move.id === 'willowisp' && isPhysicalAttacker) {
+			// Guts users BENEFIT from burn, so no penalty
+			if (slowerMon.abilityId === 'guts') continue;
+			// Fire-types and already-burned mons are immune
+			if (slowerMon.types.includes('Fire')) continue;
+			// Accuracy-weighted: WoW has 85% accuracy
+			const hitRate = (move.accuracy === true) ? 1 : (move.accuracy as number) / 100;
+			// If burn lands, physical damage halved; if misses, normal damage
+			multiplier = Math.min(multiplier, 1 - hitRate * 0.5);
+			break; // One burn is enough, no stacking
+		}
+
+		// Scald / Lava Plume etc. with burn secondary — only matters if faster
+		if (move.id === 'scald' || move.id === 'lavaplume' || move.id === 'scorchingsands') {
+			if (isPhysicalAttacker && slowerMon.abilityId !== 'guts' && !slowerMon.types.includes('Fire')) {
+				// 30% burn chance (scald/lava plume)
+				const burnChance = 0.3;
+				multiplier = Math.min(multiplier, 1 - burnChance * 0.5);
+			}
+		}
+
+		// Thunder Wave: action denial (25%) + speed halved
+		if (move.id === 'thunderwave') {
+			// Electric-type immune, Ground-type immune, Limber immune
+			if (slowerMon.types.includes('Electric')) continue;
+			if (slowerMon.types.includes('Ground')) continue;
+			if (slowerMon.abilityId === 'limber') continue;
+			const hitRate = (move.accuracy === true) ? 1 : (move.accuracy as number) / 100;
+			// Para = 75% action rate
+			multiplier = Math.min(multiplier, 1 - hitRate * 0.25);
+		}
+
+		// Nuzzle: 100% para chance, also deals damage
+		if (move.id === 'nuzzle') {
+			if (slowerMon.types.includes('Electric') || slowerMon.types.includes('Ground')) continue;
+			if (slowerMon.abilityId === 'limber') continue;
+			multiplier = Math.min(multiplier, 0.75);
+		}
+
+		// Glare / Stun Spore: para
+		if (move.id === 'glare' || move.id === 'stunspore') {
+			if (slowerMon.types.includes('Electric')) continue;
+			if (move.id === 'stunspore' && slowerMon.types.includes('Grass')) continue;
+			if (slowerMon.abilityId === 'limber') continue;
+			const hitRate = (move.accuracy === true) ? 1 : (move.accuracy as number) / 100;
+			multiplier = Math.min(multiplier, 1 - hitRate * 0.25);
+		}
+
+		// Intimidate-like stat drops: Parting Shot, Memento
+		if (move.id === 'partingshot' && isPhysicalAttacker) {
+			// -1 Atk = ~0.67x damage at +0
+			multiplier = Math.min(multiplier, 0.67);
+		}
+
+		// Charm / Feather Dance: -2 Atk
+		if ((move.id === 'charm' || move.id === 'featherdance') && isPhysicalAttacker) {
+			if (slowerMon.abilityId === 'contrary') continue; // Contrary makes it +2
+			multiplier = Math.min(multiplier, 0.5); // -2 Atk = 0.5x
+		}
+
+		// Spore / Sleep Powder / Lovely Kiss / Dark Void: sleep = 0 damage
+		if (move.id === 'spore' || move.id === 'sleeppowder' || move.id === 'lovelykiss' ||
+			move.id === 'darkvoid' || move.id === 'hypnosis' || move.id === 'yawn') {
+			// Grass types immune to powder moves (Spore, Sleep Powder)
+			if (slowerMon.types.includes('Grass') &&
+				(move.id === 'spore' || move.id === 'sleeppowder')) continue;
+			if (slowerMon.abilityId === 'insomnia' || slowerMon.abilityId === 'vitalspirit') continue;
+			if (slowerMon.abilityId === 'overcoat' && move.flags?.powder) continue;
+			// Yawn has a 1-turn delay, so less impactful in TKO calc
+			if (move.id === 'yawn') {
+				multiplier = Math.min(multiplier, 0.5); // delayed sleep = ~50% reduction
+			} else {
+				const hitRate = (move.accuracy === true) ? 1 : (move.accuracy as number) / 100;
+				// Sleep = can't attack (except Sleep Talk)
+				const hasSleepTalk = slowerMon.moves.some(m => m.id === 'sleeptalk');
+				const sleepPenalty = hasSleepTalk ? 0.5 : 1.0;
+				multiplier = Math.min(multiplier, 1 - hitRate * sleepPenalty);
+			}
+		}
+	}
+
+	return multiplier;
+}
+
+/**
+ * Estimate additional residual damage per turn that a faster mon's status
+ * moves would inflict on the slower mon (beyond their existing status).
+ *
+ * E.g., if faster mon has Will-O-Wisp and slower mon isn't burned yet,
+ * the burn DOT (1/16 maxHP) should be factored into our TKO calculation.
+ */
+function getPreMoveStatusResidual(
+	fasterMon: MonState,
+	slowerMon: MonState,
+): number {
+	// If slower mon already has a status, no new residual can be applied
+	if (slowerMon.status) return 0;
+
+	for (const move of fasterMon.moves) {
+		if (move.disabled || move.pp <= 0) continue;
+
+		// Will-O-Wisp → burn DOT: 1/16 maxHP
+		if (move.id === 'willowisp') {
+			if (slowerMon.types.includes('Fire')) continue;
+			const hitRate = (move.accuracy === true) ? 1 : (move.accuracy as number) / 100;
+			return Math.floor(slowerMon.maxhp / 16) * hitRate;
+		}
+
+		// Toxic → toxic DOT: starts at 1/16, escalates. Average ~1/8 for TKO estimate.
+		if (move.id === 'toxic') {
+			if (slowerMon.types.includes('Poison') || slowerMon.types.includes('Steel')) continue;
+			const hitRate = (move.accuracy === true) ? 1 : (move.accuracy as number) / 100;
+			return Math.floor(slowerMon.maxhp / 8) * hitRate;
+		}
+
+		// Scald burn secondary: 30% chance → 0.3 * 1/16 maxHP
+		if (move.id === 'scald' || move.id === 'lavaplume' || move.id === 'scorchingsands') {
+			if (slowerMon.types.includes('Fire')) continue;
+			return Math.floor(slowerMon.maxhp / 16) * 0.3;
+		}
+	}
+
+	return 0;
 }
 
 /**
@@ -232,16 +444,6 @@ function getResidualDamagePerTurn(mon: MonState): number {
 		return Math.floor(mon.maxhp * toxTurn / 16);
 	}
 
-	return 0;
-}
-
-/**
- * Get the priority of the best damaging move from a mon's move list.
- */
-function getPriority(mon: MonState, moveName: string): number {
-	for (const m of mon.moves) {
-		if (m.name === moveName) return m.priority;
-	}
 	return 0;
 }
 
