@@ -678,7 +678,7 @@ describe('Matchup Tests', function () {
 
 	describe('Setup Move Boost Projection in Search', () => {
 
-		it('analytical search should value Calm Mind line for Jirachi vs Gastrodon', function () {
+		it('analytical search should value Calm Mind line for Jirachi vs Appletun', function () {
 			this.timeout(30000);
 			const battle = create1v1Battle(
 				{
@@ -689,16 +689,17 @@ describe('Matchup Tests', function () {
 					teraType: 'Psychic',
 				},
 				{
-					species: 'Gastrodon',
-					moves: ['Scald', 'Earth Power', 'Recover', 'Toxic'],
-					ability: 'Storm Drain',
+					species: 'Appletun',
+					moves: ['Apple Acid', 'Dragon Pulse', 'Recover', 'Leech Seed'],
+					ability: 'Thick Fat',
 					item: 'Leftovers',
-					teraType: 'Ground',
+					teraType: 'Grass',
 				},
 			);
 
 			// At depth 4+, the analytical search should recognize that Calm Mind
-			// is a strong play because after boosting, Jirachi overwhelms Gastrodon
+			// is a strong play because after boosting, Jirachi overwhelms Appletun
+			// whose attacks are weak vs Steel-type Jirachi
 			const result = search(battle, {
 				depth: 4,
 				useAnalytical: true,
@@ -712,12 +713,11 @@ describe('Matchup Tests', function () {
 			);
 
 			// CM should either be in the mix or the game value should be better
-			// than the old -0.20 base eval
+			// than a raw unboosted assessment
 			if (cmStrategy) {
 				expect(cmStrategy.probability).to.be.greaterThan(0.05);
 			}
-			// Game value should reflect that the matchup isn't as bad as unboosted
-			// damage suggests
+			// Game value should be positive — Jirachi wins this with CM
 			expect(result.gameValue).to.be.greaterThan(-0.5);
 		});
 

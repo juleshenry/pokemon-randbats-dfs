@@ -187,19 +187,27 @@ function evaluateMatchup(
 	const p1NewResidual = p2GoesFirst ? getPreMoveStatusResidual(p2Active, p1Active) : 0;
 	const p2NewResidual = p1GoesFirst ? getPreMoveStatusResidual(p1Active, p2Active) : 0;
 
-	// Effective damage per turn = move damage + residual on defender
+	// Defender recovery (Leftovers, healing moves, etc.)
+	const p2Recovery = estimateDefenderRecovery(p2Active);
+	const p1Recovery = estimateDefenderRecovery(p1Active);
+
+	// Effective damage per turn = move damage + residual on defender - defender's recovery
 	const p1EffDmg = p1BestDmg + p2Residual + p2NewResidual;
 	const p2EffDmg = p2BestDmg + p1Residual + p1NewResidual;
 
-	// Turns to KO (using effective damage per turn vs remaining HP)
-	let p1TKO = p1EffDmg > 0 ? Math.ceil(p2Active.hp / p1EffDmg) : Infinity;
-	let p2TKO = p2EffDmg > 0 ? Math.ceil(p1Active.hp / p2EffDmg) : Infinity;
+	// Net damage for TKO calculation accounts for defender healing
+	const p1NetDmg = p1EffDmg - p2Recovery;
+	const p2NetDmg = p2EffDmg - p1Recovery;
+
+	// Turns to KO (using net damage per turn vs remaining HP)
+	let p1TKO = p1NetDmg > 0 ? Math.ceil(p2Active.hp / p1NetDmg) : Infinity;
+	let p2TKO = p2NetDmg > 0 ? Math.ceil(p1Active.hp / p2NetDmg) : Infinity;
 
 	// ─── Setup Move TKO Projection ─────────────────────────────
 	// If a mon has setup moves, compute the optimal setup+attack TKO.
 	// Only count setup as viable if the mon can survive long enough to set up.
-	const p1SetupTKO = computeSetupTKO(p1Active, p2Active, p2EffDmg, opts);
-	const p2SetupTKO = computeSetupTKO(p2Active, p1Active, p1EffDmg, opts);
+	const p1SetupTKO = computeSetupTKO(p1Active, p2Active, p2EffDmg, p1GoesFirst, opts);
+	const p2SetupTKO = computeSetupTKO(p2Active, p1Active, p1EffDmg, p2GoesFirst, opts);
 
 	if (p1SetupTKO < p1TKO) p1TKO = p1SetupTKO;
 	if (p2SetupTKO < p2TKO) p2TKO = p2SetupTKO;
@@ -259,12 +267,14 @@ function findBestDamagingMove(mon: MonState): MoveInfo | null {
  * @param attacker - The mon considering setup
  * @param defender - The opposing mon
  * @param defenderDmgPerTurn - Expected damage the defender deals per turn
+ * @param attackerGoesFirst - Whether the attacker moves before the defender
  * @param opts - Calc options (field, etc.)
  */
 function computeSetupTKO(
 	attacker: MonState,
 	defender: MonState,
 	defenderDmgPerTurn: number,
+	attackerGoesFirst: boolean,
 	opts: { field: FieldState },
 ): number {
 	// Find setup moves in attacker's moveset
@@ -310,20 +320,72 @@ function computeSetupTKO(
 			// During setupTurns, the attacker takes defenderDmgPerTurn each turn.
 			// Check if attacker survives long enough.
 			let setupTurns = result.setupTurns;
+
+			// Determine if the setup move provides defensive boosts that reduce
+			// incoming damage. The boost multiplier is (2+boost)/(2) for positive.
+			// During setup, damage is progressively reduced as boosts accumulate.
+			const defBoost = boostsDef > 0 ? boostsDef : 0;
+			const spdBoost = boostsSpd > 0 ? boostsSpd : 0;
+			// Use the higher relevant defensive boost (conservative: assume
+			// defender's best move targets the more boosted stat)
+			const relevantDefBoost = Math.max(defBoost, spdBoost);
+
 			if (setupTurns > 0 && defenderDmgPerTurn > 0) {
-				const dmgDuringSetup = defenderDmgPerTurn * setupTurns;
-				if (dmgDuringSetup >= attacker.hp) {
-					// Can't survive the setup phase. Try fewer boosts.
-					const maxSurvivableTurns = Math.floor((attacker.hp - 1) / defenderDmgPerTurn);
-					if (maxSurvivableTurns <= 0) continue;
-					// Recompute with capped setup turns
-					setupTurns = maxSurvivableTurns;
+				// Calculate average incoming damage during setup, accounting for
+				// progressive defensive boosts. Turn 1 has +0, turn 2 has +boost, etc.
+				// After using setup move on turn i (0-indexed), we have +(i+1)*boost
+				// but the damage was taken BEFORE the boost (we use CM, then get hit).
+				// Actually in simultaneous turns: we select CM, opponent selects attack.
+				// If faster, we CM first → boost applies BEFORE their attack? No —
+				// the boost resolves when the move executes. If we're faster and use CM,
+				// the boost is applied, THEN the opponent attacks into our boosted stats.
+				// If slower, opponent attacks first with our old stats, then we CM.
+				let totalDmgDuringSetup = 0;
+				for (let i = 0; i < setupTurns; i++) {
+					// If faster: CM resolves first, then opponent attacks into boosted stats
+					// On turn i: attacker has used i CMs previously, now uses CM #(i+1)
+					// If faster: boost = (i+1)*relevantDefBoost (just applied)
+					// If slower: boost = i*relevantDefBoost (applied from previous turns)
+					const currentBoostLevel = attackerGoesFirst
+						? Math.min(6, (i + 1) * relevantDefBoost)
+						: Math.min(6, i * relevantDefBoost);
+					const defMultiplier = currentBoostLevel > 0
+						? 2 / (2 + currentBoostLevel)
+						: 1;
+					totalDmgDuringSetup += defenderDmgPerTurn * defMultiplier;
 				}
-				// Adjust: attacker HP will be lower after setup, so it needs to
-				// survive the attack phase too. The total TKO from the defender's
-				// perspective includes setup turns + attack turns, so the attacker
-				// must survive that many turns of incoming damage.
-				const hpAfterSetup = attacker.hp - defenderDmgPerTurn * setupTurns;
+
+				if (totalDmgDuringSetup >= attacker.hp) {
+					// Can't survive the setup phase. Try fewer boosts.
+					// Find max survivable setup turns
+					let maxTurns = 0;
+					let cumDmg = 0;
+					for (let i = 0; i < setupTurns; i++) {
+						const bl = attackerGoesFirst
+							? Math.min(6, (i + 1) * relevantDefBoost)
+							: Math.min(6, i * relevantDefBoost);
+						const mult = bl > 0 ? 2 / (2 + bl) : 1;
+						cumDmg += defenderDmgPerTurn * mult;
+						if (cumDmg >= attacker.hp) break;
+						maxTurns = i + 1;
+					}
+					if (maxTurns <= 0) continue;
+					setupTurns = maxTurns;
+					totalDmgDuringSetup = cumDmg - defenderDmgPerTurn * (attackerGoesFirst
+						? 2 / (2 + Math.min(6, maxTurns * relevantDefBoost))
+						: 2 / (2 + Math.min(6, (maxTurns - 1) * relevantDefBoost)));
+					// Recalculate properly
+					totalDmgDuringSetup = 0;
+					for (let i = 0; i < setupTurns; i++) {
+						const bl = attackerGoesFirst
+							? Math.min(6, (i + 1) * relevantDefBoost)
+							: Math.min(6, i * relevantDefBoost);
+						const mult = bl > 0 ? 2 / (2 + bl) : 1;
+						totalDmgDuringSetup += defenderDmgPerTurn * mult;
+					}
+				}
+
+				const hpAfterSetup = attacker.hp - totalDmgDuringSetup;
 				if (hpAfterSetup <= 0) continue;
 
 				// Re-evaluate: with setupTurns boosts, how many attack turns?
@@ -341,11 +403,19 @@ function computeSetupTKO(
 				const attackTurns = Math.ceil(defender.hp / netDmg);
 				const totalTurns = setupTurns + attackTurns;
 
-				// Also verify attacker survives the attack phase
-				const totalDmgTaken = defenderDmgPerTurn * totalTurns;
-				if (totalDmgTaken >= attacker.hp) {
-					// Won't survive to finish attacking. Still might be better than
-					// the unboosted TKO if it's close.
+				// Verify attacker survives the attack phase too.
+				// During attack phase, damage is at the final boost level.
+				const finalDefBoost = Math.min(6, setupTurns * relevantDefBoost);
+				const dmgPerTurnAfterSetup = finalDefBoost > 0
+					? defenderDmgPerTurn * (2 / (2 + finalDefBoost))
+					: defenderDmgPerTurn;
+				// Faster: on last turn, attacker KOs first → attackTurns - 1 hits
+				// Slower: full attackTurns hits
+				const attackPhaseHits = attackerGoesFirst
+					? Math.max(0, attackTurns - 1)
+					: attackTurns;
+				const dmgDuringAttack = dmgPerTurnAfterSetup * attackPhaseHits;
+				if (totalDmgDuringSetup + dmgDuringAttack >= attacker.hp) {
 					continue;
 				}
 
