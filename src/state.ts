@@ -328,6 +328,10 @@ export function extractMonState(pokemon: any, index: number): MonState {
 			multihit: moveData.multihit || null,
 			target: moveData.target,
 			overrideOffensiveStat: moveData.overrideOffensiveStat || undefined,
+			boosts: moveData.boosts || undefined,
+			selfBoost: moveData.self?.boosts || undefined,
+			selfSwitch: moveData.selfSwitch || undefined,
+			forceSwitch: moveData.forceSwitch || undefined,
 		};
 	});
 

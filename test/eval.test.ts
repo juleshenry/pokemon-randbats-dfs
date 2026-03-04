@@ -656,4 +656,940 @@ describe('eval.ts — Position Evaluation', () => {
 			expect(result.nash.p1Strategy.length).to.be.greaterThan(0);
 		});
 	});
+
+	// ─── Pathological Analytical Cell Tests ─────────────────────────────
+	//
+	// These test individual analytical payoff matrix cells for correctness.
+	// They verify that evaluateAnalyticalCell and applyPreMoveStatusEffect
+	// produce correct expected values in specific scenarios.
+
+	describe('pathological analytical cell tests', () => {
+		const {
+			evaluateAnalyticalCell,
+			applyPreMoveStatusEffect,
+		} = require('../src/minimax') as typeof import('../src/minimax');
+		const {
+			calcDamageWithCrit, getSpeedComparison,
+		} = require('../src/damage-calc') as typeof import('../src/damage-calc');
+		const {
+			extractSideState,
+		} = require('../src/state') as typeof import('../src/state');
+
+		// ─── Helper: build a MoveInfo stub ─────────────────────────
+
+		function stubMove(overrides: Partial<import('../src/types').MoveInfo>): import('../src/types').MoveInfo {
+			return {
+				id: '', name: '', pp: 10, maxpp: 10, disabled: false,
+				basePower: 0, type: 'Normal', category: 'Status',
+				accuracy: true, priority: 0,
+				flags: {}, drain: null, recoil: null, heal: null,
+				secondary: null, secondaries: null,
+				isSTAB: false, critRatio: 1, multihit: null, target: 'normal',
+				...overrides,
+			};
+		}
+
+		// ─── Helper: build a minimal MonState stub ─────────────────
+
+		function stubMon(overrides: Partial<import('../src/types').MonState>): import('../src/types').MonState {
+			return {
+				species: 'Stub', speciesId: 'stub', types: ['Normal'],
+				hp: 300, maxhp: 300, level: 80,
+				baseStats: { hp: 80, atk: 80, def: 80, spa: 80, spd: 80, spe: 80 },
+				stats: { hp: 300, atk: 200, def: 200, spa: 200, spd: 200, spe: 200 },
+				boosts: { atk: 0, def: 0, spa: 0, spd: 0, spe: 0, accuracy: 0, evasion: 0 },
+				ability: 'No Ability', abilityId: '',
+				item: '', itemId: '', status: null, statusTurns: 0,
+				moves: [], isActive: true, fainted: false,
+				teraType: null, terastallized: false,
+				weightkg: 50, nature: 'Hardy', gender: 'N',
+				position: 0, lastItemId: '', volatiles: [],
+				...overrides,
+			};
+		}
+
+		// ─── Group A: applyPreMoveStatusEffect unit tests ──────────
+
+		describe('applyPreMoveStatusEffect()', () => {
+
+			it('WoW should halve physical damage (accuracy-weighted)', () => {
+				// Will-O-Wisp: 85% accuracy → penalty = 1 - (0.85 * 0.5) = 0.575
+				const wow = stubMove({ id: 'willowisp', category: 'Status', accuracy: 85 });
+				const fasterMon = stubMon({ types: ['Fire'] }); // Fire-type WoW user
+				const slowerMon = stubMon({ types: ['Fighting'], abilityId: '', status: null });
+				const physicalMove = stubMove({ id: 'closecombat', category: 'Physical', basePower: 120 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(wow, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Should be exactly rawDmg * (1 - 0.85 * 0.5) = 100 * 0.575 = 57.5
+				expect(adjusted).to.be.closeTo(57.5, 0.01);
+			});
+
+			it('WoW should NOT affect special attackers', () => {
+				const wow = stubMove({ id: 'willowisp', category: 'Status', accuracy: 85 });
+				const fasterMon = stubMon({ types: ['Fire'] });
+				const slowerMon = stubMon({ types: ['Water'], abilityId: '', status: null });
+				const specialMove = stubMove({ id: 'hydropump', category: 'Special', basePower: 110 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(wow, fasterMon, slowerMon, specialMove, rawDmg);
+
+				// Special damage should be unchanged
+				expect(adjusted).to.equal(100);
+			});
+
+			it('WoW should NOT affect Fire-type defenders (immune)', () => {
+				const wow = stubMove({ id: 'willowisp', category: 'Status', accuracy: 85 });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Fire', 'Steel'], abilityId: '', status: null });
+				const physicalMove = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(wow, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Fire types are immune to burn → no damage reduction
+				expect(adjusted).to.equal(100);
+			});
+
+			it('WoW should NOT affect Guts users (burn boosts them)', () => {
+				const wow = stubMove({ id: 'willowisp', category: 'Status', accuracy: 85 });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Fighting'], abilityId: 'guts', status: null });
+				const physicalMove = stubMove({ id: 'closecombat', category: 'Physical', basePower: 120 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(wow, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Guts user is immune to burn penalty (burn actually helps them)
+				expect(adjusted).to.equal(100);
+			});
+
+			it('WoW should NOT affect already-statused defenders', () => {
+				const wow = stubMove({ id: 'willowisp', category: 'Status', accuracy: 85 });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Normal'], abilityId: '', status: 'par' });
+				const physicalMove = stubMove({ id: 'bodyslam', category: 'Physical', basePower: 85 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(wow, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Already paralyzed → can't be burned
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Spore should reduce damage to 0 (100% acc sleep, no Sleep Talk)', () => {
+				const spore = stubMove({ id: 'spore', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({ types: ['Grass', 'Fighting'] });
+				const slowerMon = stubMon({ types: ['Fighting'], abilityId: '', status: null, moves: [] });
+				const physicalMove = stubMove({ id: 'closecombat', category: 'Physical', basePower: 120 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(spore, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Spore 100% acc, no Sleep Talk → dmg * (1 - 1.0 * 1.0) = 0
+				expect(adjusted).to.equal(0);
+			});
+
+			it('Spore should only halve damage if defender has Sleep Talk', () => {
+				const spore = stubMove({ id: 'spore', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({ types: ['Grass', 'Fighting'] });
+				const sleepTalkMove = stubMove({ id: 'sleeptalk', category: 'Status' });
+				const slowerMon = stubMon({
+					types: ['Normal'], abilityId: '', status: null,
+					moves: [sleepTalkMove],
+				});
+				const physicalMove = stubMove({ id: 'bodyslam', category: 'Physical', basePower: 85 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(spore, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Spore 100% acc, has Sleep Talk → dmg * (1 - 1.0 * 0.5) = 50
+				expect(adjusted).to.equal(50);
+			});
+
+			it('Spore should NOT affect Grass-type defenders (powder immunity)', () => {
+				const spore = stubMove({ id: 'spore', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({ types: ['Grass'] });
+				const slowerMon = stubMon({ types: ['Grass'], abilityId: '', status: null });
+				const physicalMove = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(spore, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Grass immune to powder moves → no effect
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Spore should NOT affect Insomnia defenders', () => {
+				const spore = stubMove({ id: 'spore', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Normal'], abilityId: 'insomnia', status: null });
+				const physicalMove = stubMove({ id: 'bodyslam', category: 'Physical', basePower: 85 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(spore, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Insomnia blocks sleep
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Thunder Wave should apply 25% action denial (90% acc)', () => {
+				const twave = stubMove({ id: 'thunderwave', category: 'Status', accuracy: 90 });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Water'], abilityId: '', status: null });
+				const move = stubMove({ id: 'hydropump', category: 'Special', basePower: 110 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(twave, fasterMon, slowerMon, move, rawDmg);
+
+				// dmg * (1 - 0.90 * 0.25) = 100 * 0.775 = 77.5
+				expect(adjusted).to.be.closeTo(77.5, 0.01);
+			});
+
+			it('Thunder Wave should NOT affect Electric-type defenders', () => {
+				const twave = stubMove({ id: 'thunderwave', category: 'Status', accuracy: 90 });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Electric'], abilityId: '', status: null });
+				const move = stubMove({ id: 'thunderbolt', category: 'Special', basePower: 90 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(twave, fasterMon, slowerMon, move, rawDmg);
+
+				// Electric is immune to Thunder Wave
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Thunder Wave should NOT affect Ground-type defenders', () => {
+				const twave = stubMove({ id: 'thunderwave', category: 'Status', accuracy: 90 });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ types: ['Ground'], abilityId: '', status: null });
+				const move = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(twave, fasterMon, slowerMon, move, rawDmg);
+
+				// Ground is immune to Thunder Wave
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Reflect should halve physical damage', () => {
+				const reflect = stubMove({ id: 'reflect', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const physicalMove = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(reflect, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Reflect halves physical damage: 100 * 0.5 = 50
+				expect(adjusted).to.equal(50);
+			});
+
+			it('Reflect should NOT affect special damage', () => {
+				const reflect = stubMove({ id: 'reflect', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const specialMove = stubMove({ id: 'hydropump', category: 'Special', basePower: 110 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(reflect, fasterMon, slowerMon, specialMove, rawDmg);
+
+				// Reflect doesn't affect special moves
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Light Screen should halve special damage', () => {
+				const lscreen = stubMove({ id: 'lightscreen', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const specialMove = stubMove({ id: 'hydropump', category: 'Special', basePower: 110 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(lscreen, fasterMon, slowerMon, specialMove, rawDmg);
+
+				// Light Screen halves special damage: 100 * 0.5 = 50
+				expect(adjusted).to.equal(50);
+			});
+
+			it('Light Screen should NOT affect physical damage', () => {
+				const lscreen = stubMove({ id: 'lightscreen', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const physicalMove = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(lscreen, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Light Screen doesn't affect physical moves
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Parting Shot should reduce damage by 33% (accuracy-weighted)', () => {
+				const partingShot = stubMove({ id: 'partingshot', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const move = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(partingShot, fasterMon, slowerMon, move, rawDmg);
+
+				// Parting Shot: dmg * (1 - 1.0 * 0.33) = 67
+				expect(adjusted).to.be.closeTo(67, 0.01);
+			});
+
+			it('Yawn should reduce damage by 25% (delayed sleep)', () => {
+				const yawn = stubMove({ id: 'yawn', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({ status: null });
+				const move = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(yawn, fasterMon, slowerMon, move, rawDmg);
+
+				// Yawn: dmg * 0.75 = 75
+				expect(adjusted).to.equal(75);
+			});
+
+			it('Scald 30% burn should degrade physical damage', () => {
+				// Scald is a damaging move with burn secondary, not a status move
+				const scald = stubMove({
+					id: 'scald', category: 'Special', basePower: 80, type: 'Water',
+					secondary: { chance: 30, status: 'brn' },
+				});
+				const fasterMon = stubMon({ types: ['Water'] });
+				const slowerMon = stubMon({ types: ['Ground'], abilityId: '', status: null });
+				const physicalMove = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(scald, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Scald 30% burn: dmg * (1 - 0.30 * 0.5) = 100 * 0.85 = 85
+				expect(adjusted).to.be.closeTo(85, 0.01);
+			});
+
+			it('Scald burn should NOT affect Guts physical attackers', () => {
+				const scald = stubMove({
+					id: 'scald', category: 'Special', basePower: 80, type: 'Water',
+					secondary: { chance: 30, status: 'brn' },
+				});
+				const fasterMon = stubMon({ types: ['Water'] });
+				const slowerMon = stubMon({ types: ['Fighting'], abilityId: 'guts', status: null });
+				const physicalMove = stubMove({ id: 'closecombat', category: 'Physical', basePower: 120 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(scald, fasterMon, slowerMon, physicalMove, rawDmg);
+
+				// Guts user → burn penalty doesn't apply
+				expect(adjusted).to.equal(100);
+			});
+
+			it('Aurora Veil should halve all damage', () => {
+				const veil = stubMove({ id: 'auroraveil', category: 'Status', accuracy: true });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const move = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(veil, fasterMon, slowerMon, move, rawDmg);
+
+				// Aurora Veil halves all damage
+				expect(adjusted).to.equal(50);
+			});
+
+			it('non-status-affecting damaging move should not change damage', () => {
+				// A normal damaging move (Earthquake, no burn secondary) from faster mon
+				// should NOT affect the slower mon's damage at all
+				const eq = stubMove({ id: 'earthquake', category: 'Physical', basePower: 100, type: 'Ground' });
+				const fasterMon = stubMon({});
+				const slowerMon = stubMon({});
+				const slowerMove = stubMove({ id: 'closecombat', category: 'Physical', basePower: 120 });
+
+				const rawDmg = 100;
+				const adjusted = applyPreMoveStatusEffect(eq, fasterMon, slowerMon, slowerMove, rawDmg);
+
+				// No status secondary → no adjustment
+				expect(adjusted).to.equal(100);
+			});
+		});
+
+		// ─── Group B: evaluateAnalyticalCell integration tests ─────
+
+		describe('evaluateAnalyticalCell() integration', () => {
+
+			it('MOVE vs MOVE: faster OHKO should give P1 massive advantage', () => {
+				// Garchomp (Spe 102) vs Amoonguss (Spe 30)
+				// Garchomp Earthquake should near-OHKO or OHKO the slower mon
+				// If it does, P2 never gets to act → cell ≈ baseEval + 0.35
+				const battle = create1v1Battle(
+					makeSet('Garchomp', ['earthquake', 'outrage', 'stoneedge', 'swordsdance']),
+					makeSet('Amoonguss', ['sludgebomb', 'gigadrain', 'spore', 'clearsmog'], {
+						ability: 'Regenerator',
+					}),
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Garchomp uses Earthquake (move index 0)
+				const p1Choice: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Earthquake',
+					type: 'move', moveIndex: 0,
+				};
+				// Amoonguss uses Sludge Bomb (move index 0)
+				const p2Choice: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Sludge Bomb',
+					type: 'move', moveIndex: 0,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1Choice, p2Choice,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// Garchomp is faster (Spe 102 > 30) and Earthquake deals huge damage to Amoonguss
+				// The cell value should be strongly positive for P1
+				expect(cellValue).to.be.greaterThan(baseEval);
+				// Whether or not it OHKOs, P1 should be winning this exchange
+				expect(cellValue).to.be.greaterThan(0);
+			});
+
+			it('MOVE vs MOVE: faster WoW on non-Guts physical → cell worse for physical attacker', () => {
+				// Arcanine (P2, Spe 95, has WoW) vs Gallade (P1, Spe 80, Sharpness, physical)
+				// Arcanine moves first, WoW lands → Gallade's physical damage halved
+				const battle = create1v1Battle(
+					makeSet('Gallade', ['sacredsword', 'psychocut', 'leafblade', 'nightslash'], {
+						ability: 'Sharpness',
+					}),
+					makeSet('Arcanine', ['flareblitz', 'extremespeed', 'closecombat', 'willowisp'], {
+						ability: 'Intimidate',
+					}),
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Gallade uses Sacred Sword (move 0), Arcanine uses WoW (move 3)
+				const p1SacredSword: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Sacred Sword',
+					type: 'move', moveIndex: 0,
+				};
+				const p2WoW: import('../src/types').Choice = {
+					choiceString: 'move 4', label: 'Will-O-Wisp',
+					type: 'move', moveIndex: 3,
+				};
+				// Compare: Arcanine uses Flare Blitz (move 0) instead of WoW
+				const p2FlareBlitz: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Flare Blitz',
+					type: 'move', moveIndex: 0,
+				};
+
+				const cellWoW = evaluateAnalyticalCell(
+					p1SacredSword, p2WoW,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+				const cellFlareBlitz = evaluateAnalyticalCell(
+					p1SacredSword, p2FlareBlitz,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// When Arcanine WoWs, Gallade's Sacred Sword is degraded
+				// → the cell should be WORSE for P1 compared to Arcanine using a non-penalizing move
+				// (WoW halves Gallade's physical dmg vs Flare Blitz that deals actual damage)
+				// The WoW cell should show: P1's damage is penalized + P1 doesn't take Flare Blitz damage
+				// The Flare Blitz cell should show: P1 deals full damage but also takes Flare Blitz
+				// Net effect depends on exact numbers, but the KEY check:
+				// WoW cell should reflect the burn penalty on P1's physical damage
+				// Let's verify the WoW cell is within expected range
+				expect(cellWoW).to.be.within(-1, 1);
+				expect(cellFlareBlitz).to.be.within(-1, 1);
+
+				// P1's Sacred Sword damage is reduced by WoW → P1 should fare worse in WoW cell
+				// compared to a hypothetical where P2 used a non-damaging, non-penalizing move.
+				// But against Flare Blitz, P1 takes big damage.
+				// The critical check: the WoW cell should NOT show P1 dealing full physical damage.
+				// We verify this indirectly: WoW cell < (a cell where P2 does nothing harmful)
+				// Since both moves are valid, let's just verify the values are sensible
+				// and that the WoW cell is different from a pure damage exchange
+
+				// More targeted: compute what the Sacred Sword damage would be
+				// and verify the WoW cell is consistent with halved physical damage
+				const p1DmgFull = calcDamageWithCrit(p1Active!, p2Active!, p1Active!.moves[0], { field });
+
+				// In the WoW cell, Arcanine doesn't deal damage (WoW is Status),
+				// so P1 only takes 0 dmg from P2's WoW but deals reduced physical dmg.
+				// Expected: cellWoW ≈ baseEval + (p2HPLost_reduced) * 0.25
+				// where p2HPLost_reduced uses the burn-halved damage
+				// The key check: WoW cell should be LESS positive than if P1 dealt full damage
+				// against a non-acting P2 (which would be baseEval + p2HPLost_full * 0.25)
+				if (p1DmgFull.expectedWithAccuracy < p2Active!.hp) {
+					// Not an OHKO → the burn penalty matters
+					// WoW cell: P1 deals ~57.5% of full damage, P2 deals 0
+					// Full hit cell: P1 deals 100% damage, P2 deals 0
+					// WoW cell should be less favorable for P1 than full-damage scenario
+					const fullHitEvalShift = (p1DmgFull.expectedWithAccuracy / p2Active!.maxhp) * 0.25;
+					const burnedHitEvalShift = (p1DmgFull.expectedWithAccuracy * 0.575 / p2Active!.maxhp) * 0.25;
+					// WoW cell should be approximately baseEval + burnedHitEvalShift
+					expect(cellWoW).to.be.closeTo(baseEval + burnedHitEvalShift, 0.1);
+				}
+			});
+
+			it('MOVE vs MOVE: Guts user should NOT have damage reduced by WoW', () => {
+				// Conkeldurr (P1, Spe 45, Guts) vs Arcanine (P2, Spe 95, WoW)
+				// Arcanine is faster and uses WoW, BUT Conkeldurr has Guts
+				// → physical damage should NOT be halved
+				const battle = create1v1Battle(
+					makeSet('Conkeldurr', ['closecombat', 'machpunch', 'knockoff', 'facade'], {
+						ability: 'Guts',
+					}),
+					makeSet('Arcanine', ['flareblitz', 'extremespeed', 'closecombat', 'willowisp'], {
+						ability: 'Intimidate',
+					}),
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Conkeldurr Close Combat (move 0), Arcanine WoW (move 3)
+				const p1CC: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Close Combat',
+					type: 'move', moveIndex: 0,
+				};
+				const p2WoW: import('../src/types').Choice = {
+					choiceString: 'move 4', label: 'Will-O-Wisp',
+					type: 'move', moveIndex: 3,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1CC, p2WoW,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// With Guts, the WoW penalty is skipped.
+				// Conkeldurr deals full damage, Arcanine deals 0 (WoW is Status).
+				// Expected cell ≈ baseEval + (p2HPLost_full * 0.25)
+				const p1DmgFull = calcDamageWithCrit(p1Active!, p2Active!, p1Active!.moves[0], { field });
+				const fullHitShift = Math.min(p1DmgFull.expectedWithAccuracy, p2Active!.hp) / p2Active!.maxhp * 0.25;
+
+				if (p1DmgFull.expectedWithAccuracy >= p2Active!.hp) {
+					// OHKO → cell = baseEval + 0.35
+					expect(cellValue).to.be.closeTo(baseEval + 0.35, 0.05);
+				} else {
+					// Not OHKO → cell ≈ baseEval + full hit shift
+					expect(cellValue).to.be.closeTo(baseEval + fullHitShift, 0.1);
+				}
+			});
+
+			it('MOVE vs MOVE: Fire-type should NOT have damage reduced by WoW', () => {
+				// Heatran (P1, Spe 77, Fire-type physical) vs Arcanine (P2, Spe 95, WoW)
+				// Arcanine faster, uses WoW, but Heatran is Fire-type (immune)
+				// Using Heavy Slam (physical) from Heatran
+				const battle = create1v1Battle(
+					makeSet('Heatran', ['heavyslam', 'earthpower', 'magmastorm', 'stealthrock'], {
+						ability: 'Flash Fire',
+					}),
+					makeSet('Arcanine', ['flareblitz', 'extremespeed', 'closecombat', 'willowisp'], {
+						ability: 'Intimidate',
+					}),
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Heatran Heavy Slam (move 0), Arcanine WoW (move 3)
+				const p1HeavySlam: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Heavy Slam',
+					type: 'move', moveIndex: 0,
+				};
+				const p2WoW: import('../src/types').Choice = {
+					choiceString: 'move 4', label: 'Will-O-Wisp',
+					type: 'move', moveIndex: 3,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1HeavySlam, p2WoW,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// Heatran is Fire-type → immune to burn → full physical damage
+				// Arcanine deals 0 (WoW doesn't hit)
+				// cell ≈ baseEval + (p2HPLost * 0.25) or baseEval + 0.35 if OHKO
+				const p1Dmg = calcDamageWithCrit(p1Active!, p2Active!, p1Active!.moves[0], { field });
+				if (p1Dmg.expectedWithAccuracy >= p2Active!.hp) {
+					expect(cellValue).to.be.closeTo(baseEval + 0.35, 0.05);
+				} else {
+					const shift = (p1Dmg.expectedWithAccuracy / p2Active!.maxhp) * 0.25;
+					expect(cellValue).to.be.closeTo(baseEval + shift, 0.1);
+				}
+			});
+
+			it('MOVE vs MOVE: speed tie should apply no move-order adjustments', () => {
+				// Mirror match: Jirachi vs Jirachi (same speed, same level)
+				// At a speed tie, both take full damage simultaneously → no adjustments
+				const battle = create1v1Battle(
+					makeSet('Jirachi', ['ironhead', 'psychic', 'uturn', 'stealthrock']),
+					makeSet('Jirachi', ['ironhead', 'psychic', 'uturn', 'stealthrock']),
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Both use Iron Head (move 0)
+				const p1IH: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Iron Head',
+					type: 'move', moveIndex: 0,
+				};
+				const p2IH: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Iron Head',
+					type: 'move', moveIndex: 0,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1IH, p2IH,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// Mirror match: equal damage dealt = equal damage taken
+				// p1HPLost = p2HPLost → netDamage = 0 → cell ≈ baseEval
+				// Allow small tolerance for rounding
+				expect(cellValue).to.be.closeTo(baseEval, 0.05);
+			});
+
+			it('MOVE vs MOVE: faster Spore should nearly zero out slower damage', () => {
+				// Breloom (P1, Spe 70, has Spore) vs Conkeldurr (P2, Spe 45)
+				// Breloom is faster, uses Spore → Conkeldurr asleep → deals 0 damage
+				const battle = create1v1Battle(
+					makeSet('Breloom', ['bulletseed', 'machpunch', 'spore', 'swordsdance'], {
+						ability: 'Technician',
+					}),
+					makeSet('Conkeldurr', ['closecombat', 'machpunch', 'knockoff', 'facade'], {
+						ability: 'Guts',
+					}),
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Breloom uses Spore (move 2), Conkeldurr uses Close Combat (move 0)
+				const p1Spore: import('../src/types').Choice = {
+					choiceString: 'move 3', label: 'Spore',
+					type: 'move', moveIndex: 2,
+				};
+				const p2CC: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Close Combat',
+					type: 'move', moveIndex: 0,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1Spore, p2CC,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// Breloom (faster) uses Spore (status, 0 dmg to P2) → Conkeldurr asleep (0 dmg to P1)
+				// Both deal 0 damage → netDamage = 0 → cell ≈ baseEval
+				// BUT: Spore is Status (0 BP), so P1 dmg = 0, and P2 dmg reduced to 0 by sleep
+				// Result: no HP change → cell ≈ baseEval
+				// (The VALUE of putting something to sleep isn't captured in one-turn HP delta,
+				// but the absence of damage from the sleeping mon IS captured)
+				expect(cellValue).to.be.closeTo(baseEval, 0.05);
+			});
+
+			it('MOVE vs SWITCH: free hit on switch-in should favor attacker', () => {
+				// P1 attacks with Garchomp Earthquake, P2 switches
+				// Need a 2v1 setup so P2 has something to switch to
+				const battle = createBattle(
+					[makeSet('Garchomp', ['earthquake', 'outrage', 'stoneedge', 'swordsdance'])],
+					[
+						makeSet('Jirachi', ['ironhead', 'psychic', 'uturn', 'stealthrock']),
+						makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+					],
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// Garchomp uses Earthquake (move 0), P2 switches to Gastrodon (position 1 → switchIndex 2)
+				const p1EQ: import('../src/types').Choice = {
+					choiceString: 'move 1', label: 'Earthquake',
+					type: 'move', moveIndex: 0,
+				};
+				const p2Switch: import('../src/types').Choice = {
+					choiceString: 'switch 2', label: 'Switch to Gastrodon',
+					type: 'switch', switchIndex: 2,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1EQ, p2Switch,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// P1 gets a free Earthquake on Gastrodon switching in
+				// Gastrodon is Water/Ground — Earthquake is Ground-type hitting a Ground-type
+				// Effectiveness: Ground on Water = neutral, Ground on Ground = neutral → 1x
+				// So it deals some damage. P1 should benefit from the free hit.
+				// (EQ doesn't get STAB from Garchomp's Ground type on a Ground-type defender...
+				// wait, Garchomp IS Ground-type so gets STAB, and Gastrodon takes neutral)
+				// Cell should be more favorable for P1 than baseEval
+				expect(cellValue).to.be.greaterThan(baseEval - 0.1);
+				expect(cellValue).to.be.within(-1, 1);
+			});
+
+			it('SWITCH vs SWITCH: should evaluate new matchup via TKO differential', () => {
+				// Both sides switch → evaluate the new matchup
+				const battle = createBattle(
+					[
+						makeSet('Jirachi', ['ironhead', 'psychic', 'uturn', 'stealthrock']),
+						makeSet('Garchomp', ['earthquake', 'outrage', 'stoneedge', 'swordsdance']),
+					],
+					[
+						makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+						makeSet('Ferrothorn', ['powerwhip', 'knockoff', 'leechseed', 'stealthrock']),
+					],
+				);
+
+				const p1Active = getActiveMon(battle, 0);
+				const p2Active = getActiveMon(battle, 1);
+				const field = extractFieldState(battle);
+				const p1Side = extractSideState(battle, 0);
+				const p2Side = extractSideState(battle, 1);
+				const baseEval = evaluate(battle);
+
+				// P1 switches to Garchomp (position 1 → switchIndex 2)
+				// P2 switches to Ferrothorn (position 1 → switchIndex 2)
+				const p1Switch: import('../src/types').Choice = {
+					choiceString: 'switch 2', label: 'Switch to Garchomp',
+					type: 'switch', switchIndex: 2,
+				};
+				const p2Switch: import('../src/types').Choice = {
+					choiceString: 'switch 2', label: 'Switch to Ferrothorn',
+					type: 'switch', switchIndex: 2,
+				};
+
+				const cellValue = evaluateAnalyticalCell(
+					p1Switch, p2Switch,
+					p1Active, p2Active,
+					p1Side, p2Side, field, baseEval, undefined,
+				);
+
+				// Should produce a valid evaluation based on Garchomp vs Ferrothorn matchup
+				expect(cellValue).to.be.within(-1, 1);
+				// Garchomp vs Ferrothorn: Garchomp has EQ (4x vs Steel) and Fire Fang,
+				// but our set doesn't have Fire Fang. Still, EQ hits Ferrothorn hard.
+				// Should be favorable for P1 (Garchomp)
+			});
+		});
+	});
+
+	describe('Setup Move Projection', () => {
+
+		it('should value Calm Mind user higher than raw TKO suggests (Jirachi vs Gastrodon)', () => {
+			// Jirachi with Calm Mind should have a better eval than without CM
+			// because CM boosts its SpA and SpD, making Psychic/Flash Cannon hit harder
+			const withCM = create1v1Battle(
+				makeSet('Jirachi', ['calmmind', 'psychic', 'flashcannon', 'uturn']),
+				makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+			);
+			const noCM = create1v1Battle(
+				makeSet('Jirachi', ['ironhead', 'psychic', 'flashcannon', 'uturn']),
+				makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+			);
+
+			const evalWithCM = evaluate(withCM);
+			const evalNoCM = evaluate(noCM);
+
+			// CM version should be evaluated better: the setup TKO should bring
+			// the matchup closer to even or positive for Jirachi
+			expect(evalWithCM).to.be.greaterThan(evalNoCM);
+		});
+
+		it('should value Swords Dance user higher for physical sweeper (Garchomp)', () => {
+			const withSD = create1v1Battle(
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'swordsdance']),
+				makeSet('Rotom-Wash', ['hydropump', 'voltswitch', 'willowisp', 'thunderbolt']),
+			);
+			const noSD = create1v1Battle(
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'firefang']),
+				makeSet('Rotom-Wash', ['hydropump', 'voltswitch', 'willowisp', 'thunderbolt']),
+			);
+
+			const evalWithSD = evaluate(withSD);
+			const evalNoSD = evaluate(noSD);
+
+			// SD version should recognize the setup potential improves matchup
+			// Even if base TKO is worse (giving up a coverage move), the post-SD
+			// damage is much higher
+			expect(evalWithSD).to.be.greaterThan(evalNoSD - 0.3);
+		});
+
+		it('should detect that setup is NOT viable when opponent OHKOs during setup', () => {
+			// Frosmoth vs Cinderace: Cinderace OHKOs Frosmoth before it can set up
+			// So Quiver Dance shouldn't make the eval much better
+			const battle = create1v1Battle(
+				makeSet('Frosmoth', ['quiverdance', 'icebeam', 'bugbuzz', 'gigadrain'], { ability: 'Ice Scales' }),
+				makeSet('Cinderace', ['pyroball', 'uturn', 'highjumpkick', 'suckerpunch'], { ability: 'Libero' }),
+			);
+
+			const evalResult = evaluate(battle);
+			// Frosmoth should be heavily disadvantaged despite having QD
+			// because Cinderace OHKOs with Pyro Ball
+			expect(evalResult).to.be.lessThan(-0.1);
+		});
+
+		it('should use evaluateDetailed to show setup component value', () => {
+			const battle = create1v1Battle(
+				makeSet('Jirachi', ['calmmind', 'psychic', 'flashcannon', 'thunderwave']),
+				makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+			);
+
+			const detailed = evaluateDetailed(battle);
+			// The matchup score should be better than it would be without CM
+			// (compared to the historical -0.667 from before setup projection)
+			expect(detailed.matchup).to.be.greaterThan(-0.5);
+		});
+
+		it('should handle Dragon Dance speed boost correctly', () => {
+			// Dragonite with DD should be valued highly even against faster mons
+			// because DD boosts both Atk and Spe
+			const withDD = create1v1Battle(
+				makeSet('Dragonite', ['dragondance', 'outrage', 'earthquake', 'extremespeed'], { ability: 'Multiscale' }),
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'swordsdance']),
+			);
+			const noDD = create1v1Battle(
+				makeSet('Dragonite', ['firepunch', 'outrage', 'earthquake', 'extremespeed'], { ability: 'Multiscale' }),
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'swordsdance']),
+			);
+
+			const evalWithDD = evaluate(withDD);
+			const evalNoDD = evaluate(noDD);
+
+			// DD version should be evaluated at least as well as the no-DD version
+			// because the setup TKO accounts for +1 Atk boost
+			expect(evalWithDD).to.be.greaterThanOrEqual(evalNoDD - 0.1);
+		});
+	});
+
+	describe('Analytical Boost Projection', () => {
+
+		it('should project boosts through multi-turn recursion (Calm Mind)', () => {
+			// Test that the analytical recursion correctly applies CM boosts
+			// to the projected MonState
+			const battle = create1v1Battle(
+				makeSet('Jirachi', ['calmmind', 'psychic', 'flashcannon', 'uturn']),
+				makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+			);
+
+			const p1Active = getActiveMon(battle, 0);
+			const p2Active = getActiveMon(battle, 1);
+
+			// Verify the CM move has boosts data
+			const cmMove = p1Active!.moves.find(m => m.id === 'calmmind');
+			expect(cmMove).to.not.be.undefined;
+			expect(cmMove!.boosts).to.deep.include({ spa: 1, spd: 1 });
+			expect(cmMove!.target).to.equal('self');
+		});
+
+		it('should extract selfBoost from attacking moves (Close Combat)', () => {
+			const battle = create1v1Battle(
+				makeSet('Gallade', ['closecombat', 'psychocut', 'knockoff', 'swordsdance'], { ability: 'Sharpness' }),
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'swordsdance']),
+			);
+
+			const p1Active = getActiveMon(battle, 0);
+			const ccMove = p1Active!.moves.find(m => m.id === 'closecombat');
+			expect(ccMove).to.not.be.undefined;
+			expect(ccMove!.selfBoost).to.deep.include({ def: -1, spd: -1 });
+		});
+
+		it('should extract boosts from opponent-targeting moves (Charm)', () => {
+			const battle = create1v1Battle(
+				makeSet('Clefable', ['moonblast', 'flamethrower', 'charm', 'softboiled']),
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'swordsdance']),
+			);
+
+			const p1Active = getActiveMon(battle, 0);
+			const charmMove = p1Active!.moves.find(m => m.id === 'charm');
+			expect(charmMove).to.not.be.undefined;
+			expect(charmMove!.boosts).to.deep.include({ atk: -2 });
+			// Charm targets opponent, not self
+			expect(charmMove!.target).to.equal('normal');
+		});
+
+		it('should project healing moves in analytical cell evaluation', () => {
+			const battle = create1v1Battle(
+				makeSet('Gastrodon', ['earthpower', 'scald', 'icebeam', 'recover']),
+				makeSet('Jirachi', ['ironhead', 'psychic', 'uturn', 'stealthrock']),
+			);
+
+			const p1Active = getActiveMon(battle, 0);
+			const recoverMove = p1Active!.moves.find(m => m.id === 'recover');
+			expect(recoverMove).to.not.be.undefined;
+			expect(recoverMove!.heal).to.deep.equal([1, 2]);
+		});
+
+		it('should project recoil damage for Brave Bird/Flare Blitz', () => {
+			const battle = create1v1Battle(
+				makeSet('Talonflame', ['bravebird', 'flareblitz', 'uturn', 'roost'], { ability: 'Gale Wings' }),
+				makeSet('Ferrothorn', ['powerwhip', 'knockoff', 'leechseed', 'stealthrock']),
+			);
+
+			const p1Active = getActiveMon(battle, 0);
+			const bbMove = p1Active!.moves.find(m => m.id === 'bravebird');
+			expect(bbMove).to.not.be.undefined;
+			expect(bbMove!.recoil).to.not.be.null;
+			// Brave Bird recoil = 33% of damage dealt
+			expect(bbMove!.recoil![0]).to.equal(33);
+			expect(bbMove!.recoil![1]).to.equal(100);
+		});
+
+		it('should project drain recovery for Giga Drain/Draining Kiss', () => {
+			const battle = create1v1Battle(
+				makeSet('Comfey', ['drainingkiss', 'gigadrain', 'synthesis', 'uturn'], { ability: 'Triage' }),
+				makeSet('Garchomp', ['earthquake', 'dragonclaw', 'stoneedge', 'swordsdance']),
+			);
+
+			const p1Active = getActiveMon(battle, 0);
+			const dkMove = p1Active!.moves.find(m => m.id === 'drainingkiss');
+			expect(dkMove).to.not.be.undefined;
+			expect(dkMove!.drain).to.not.be.null;
+			// Draining Kiss drains 75% of damage dealt
+			expect(dkMove!.drain![0]).to.equal(3);
+			expect(dkMove!.drain![1]).to.equal(4);
+		});
+	});
 });

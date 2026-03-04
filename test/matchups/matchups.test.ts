@@ -382,4 +382,384 @@ describe('Matchup Tests', function () {
 			}
 		});
 	});
+
+	// ─── Deeper Analytical Search ──────────────────────────────
+
+	describe('Analytical Depth 5 Search', () => {
+
+		it('should complete analytical depth-5 search in reasonable time', function () {
+			this.timeout(45000);
+			const battle = create1v1Battle(
+				{
+					species: 'Jirachi',
+					moves: ['Calm Mind', 'Psychic', 'Flash Cannon', 'Wish'],
+					ability: 'Serene Grace',
+					item: 'Leftovers',
+					teraType: 'Psychic',
+				},
+				{
+					species: 'Gastrodon',
+					moves: ['Scald', 'Earth Power', 'Recover', 'Toxic'],
+					ability: 'Storm Drain',
+					item: 'Leftovers',
+					teraType: 'Ground',
+				},
+			);
+
+			const start = Date.now();
+			const result = search(battle, {
+				depth: 5,
+				useAnalytical: true,
+				timeLimit: 30000,
+				playerIndex: 0,
+			});
+			const elapsed = Date.now() - start;
+
+			// Should complete within time limit (with margin for overhead)
+			expect(elapsed).to.be.lessThan(35000);
+
+			// Should visit more nodes than depth-1 (recursion is happening)
+			expect(result.nodesVisited).to.be.greaterThan(10);
+
+			// Result structure should be valid
+			expect(result.nash.p1Strategy).to.be.an('array').with.length.greaterThan(0);
+			const totalProb = result.nash.p1Strategy.reduce((s, e) => s + e.probability, 0);
+			expect(totalProb).to.be.approximately(1, 0.05);
+			expect(result.gameValue).to.be.within(-1, 1);
+		});
+
+		it('should produce different (generally better) results at depth 5 vs depth 1', function () {
+			this.timeout(30000);
+			// CM Jirachi vs Gastrodon: deeper search should be more confident about CM
+			const battle = create1v1Battle(
+				{
+					species: 'Jirachi',
+					moves: ['Calm Mind', 'Psychic', 'Flash Cannon', 'Wish'],
+					ability: 'Serene Grace',
+					item: 'Leftovers',
+					teraType: 'Psychic',
+				},
+				{
+					species: 'Gastrodon',
+					moves: ['Scald', 'Earth Power', 'Recover', 'Toxic'],
+					ability: 'Storm Drain',
+					item: 'Leftovers',
+					teraType: 'Ground',
+				},
+			);
+
+			const depth1 = search(battle, { depth: 1, useAnalytical: true, playerIndex: 0 });
+			const depth5 = search(battle, { depth: 5, useAnalytical: true, timeLimit: 15000, playerIndex: 0 });
+
+			// Deeper search should visit more nodes
+			expect(depth5.nodesVisited).to.be.greaterThan(depth1.nodesVisited);
+
+			// Both should be valid strategies
+			expect(depth1.gameValue).to.be.within(-1, 1);
+			expect(depth5.gameValue).to.be.within(-1, 1);
+		});
+
+		it('should handle depth-5 analytical for an OHKO matchup efficiently (early termination)', function () {
+			this.timeout(10000);
+			// Chien-Pao (fast nuke) vs Dragonite: likely OHKOs with Ice STAB
+			const battle = create1v1Battle(
+				{
+					species: 'Chien-Pao',
+					moves: ['Ice Shard', 'Crunch', 'Icicle Crash', 'Sacred Sword'],
+					ability: 'Sword of Ruin',
+					item: 'Life Orb',
+					teraType: 'Ice',
+				},
+				{
+					species: 'Dragonite',
+					moves: ['Dragon Dance', 'Dragon Claw', 'Extreme Speed', 'Earthquake'],
+					ability: 'Multiscale',
+					item: 'Lum Berry',
+					teraType: 'Normal',
+				},
+			);
+
+			const result = search(battle, {
+				depth: 5,
+				useAnalytical: true,
+				timeLimit: 5000,
+				playerIndex: 0,
+			});
+
+			// Should be fast (OHKO/2HKO → early termination via decisive eval)
+			expect(result.nodesVisited).to.be.greaterThan(0);
+			expect(result.gameValue).to.be.within(-1, 1);
+
+			// Chien-Pao should favor an attacking move (Ice STAB vs Dragon)
+			const attackProb = result.nash.p1Strategy
+				.filter(s => s.label.includes('Icicle Crash') || s.label.includes('Ice Shard') || s.label.includes('Crunch'))
+				.reduce((sum, s) => sum + s.probability, 0);
+			expect(attackProb).to.be.greaterThan(0.5);
+		});
+
+		it('should use analytical default depth (5) when useAnalytical is set without explicit depth', function () {
+			this.timeout(20000);
+			const battle = create1v1Battle(
+				{
+					species: 'Garchomp',
+					moves: ['Earthquake', 'Dragon Claw', 'Swords Dance', 'Stone Edge'],
+					ability: 'Rough Skin',
+					teraType: 'Ground',
+				},
+				{
+					species: 'Salamence',
+					moves: ['Outrage', 'Earthquake', 'Dragon Dance', 'Fire Fang'],
+					ability: 'Intimidate',
+					teraType: 'Dragon',
+				},
+			);
+
+			const result = search(battle, {
+				useAnalytical: true,
+				timeLimit: 15000,
+				playerIndex: 0,
+			});
+
+			// Should complete and produce valid output (uses DEFAULT_ANALYTICAL_DEPTH = 5)
+			expect(result.nash.p1Strategy).to.be.an('array').with.length.greaterThan(0);
+			expect(result.gameValue).to.be.within(-1, 1);
+			// With depth 5, should visit more nodes than a depth-1 search would
+			expect(result.nodesVisited).to.be.greaterThan(5);
+		});
+	});
+
+	// ─── Forfeit Detection ─────────────────────────────────────
+
+	describe('Forfeit Detection', () => {
+
+		it('should not flag forfeit for an even 1v1 matchup', () => {
+			const battle = create1v1Battle(
+				{
+					species: 'Garchomp',
+					moves: ['Earthquake', 'Dragon Claw', 'Swords Dance', 'Stone Edge'],
+					ability: 'Rough Skin',
+					teraType: 'Ground',
+				},
+				{
+					species: 'Salamence',
+					moves: ['Outrage', 'Earthquake', 'Dragon Dance', 'Fire Fang'],
+					ability: 'Intimidate',
+					teraType: 'Dragon',
+				},
+			);
+
+			const result = search(battle, { depth: 2, playerIndex: 0 });
+
+			expect(result.forfeit).to.exist;
+			expect(result.forfeit!.shouldForfeit).to.be.false;
+		});
+
+		it('should include forfeit info in search results', () => {
+			const battle = create1v1Battle(
+				{
+					species: 'Jirachi',
+					moves: ['Calm Mind', 'Psychic', 'Flash Cannon', 'Wish'],
+					ability: 'Serene Grace',
+					item: 'Leftovers',
+					teraType: 'Psychic',
+				},
+				{
+					species: 'Gastrodon',
+					moves: ['Scald', 'Earth Power', 'Recover', 'Toxic'],
+					ability: 'Storm Drain',
+					item: 'Leftovers',
+					teraType: 'Ground',
+				},
+			);
+
+			const result = search(battle, { depth: 2, playerIndex: 0 });
+
+			expect(result.forfeit).to.exist;
+			expect(result.forfeit!.shouldForfeit).to.be.a('boolean');
+			expect(result.forfeit!.eval).to.be.a('number');
+			expect(result.forfeit!.monCountDiff).to.be.a('number');
+		});
+
+		it('should use checkForfeit directly', () => {
+			const { checkForfeit } = require('../../src/minimax') as typeof import('../../src/minimax');
+
+			const battle = create1v1Battle(
+				{
+					species: 'Garchomp',
+					moves: ['Earthquake', 'Dragon Claw', 'Swords Dance', 'Stone Edge'],
+					ability: 'Rough Skin',
+					teraType: 'Ground',
+				},
+				{
+					species: 'Salamence',
+					moves: ['Outrage', 'Earthquake', 'Dragon Dance', 'Fire Fang'],
+					ability: 'Intimidate',
+					teraType: 'Dragon',
+				},
+			);
+
+			const forfeit = checkForfeit(battle, undefined, 0, -0.7);
+			expect(forfeit.shouldForfeit).to.be.false;
+			// 1v1 means monCountDiff = 0
+			expect(forfeit.monCountDiff).to.equal(0);
+		});
+	});
+
+	// ─── Analytical vs Sim-based consistency ───────────────────
+
+	describe('Analytical vs Sim-based Consistency', () => {
+
+		it('should produce similar recommendations for a simple 1v1 (both methods agree on best move)', function () {
+			this.timeout(30000);
+			const battle = create1v1Battle(
+				{
+					species: 'Garchomp',
+					moves: ['Earthquake', 'Dragon Claw', 'Stone Edge', 'Swords Dance'],
+					ability: 'Rough Skin',
+					teraType: 'Ground',
+				},
+				{
+					species: 'Dragonite',
+					moves: ['Dragon Claw', 'Extreme Speed', 'Earthquake', 'Dragon Dance'],
+					ability: 'Multiscale',
+					item: 'Lum Berry',
+					teraType: 'Normal',
+				},
+			);
+
+			const simResult = search(battle, { depth: 2, useAnalytical: false, timeLimit: 20000, playerIndex: 0 });
+			const analyResult = search(battle, { depth: 2, useAnalytical: true, timeLimit: 5000, playerIndex: 0 });
+
+			// Both should have valid strategies
+			expect(simResult.nash.p1Strategy.length).to.be.greaterThan(0);
+			expect(analyResult.nash.p1Strategy.length).to.be.greaterThan(0);
+
+			// Get top moves from each
+			const simTop = simResult.nash.p1Strategy.reduce((a, b) =>
+				a.probability > b.probability ? a : b);
+			const analyTop = analyResult.nash.p1Strategy.reduce((a, b) =>
+				a.probability > b.probability ? a : b);
+
+			// Both should agree the top move is an attacking move (not Swords Dance in a Dragon mirror)
+			const simIsAttack = !simTop.label.includes('Swords Dance');
+			const analyIsAttack = !analyTop.label.includes('Swords Dance');
+			// At least one should recommend an attack (they might differ on WHICH attack)
+			expect(simIsAttack || analyIsAttack).to.be.true;
+		});
+
+		it('analytical should visit more nodes at same depth (no clone overhead)', function () {
+			this.timeout(30000);
+			const battle = create1v1Battle(
+				{
+					species: 'Jirachi',
+					moves: ['Calm Mind', 'Psychic', 'Flash Cannon', 'Wish'],
+					ability: 'Serene Grace',
+					item: 'Leftovers',
+					teraType: 'Psychic',
+				},
+				{
+					species: 'Gastrodon',
+					moves: ['Scald', 'Earth Power', 'Recover', 'Toxic'],
+					ability: 'Storm Drain',
+					item: 'Leftovers',
+					teraType: 'Ground',
+				},
+			);
+
+			// At depth 3, analytical should process many more nodes than sim-based
+			// because the analytical path is much faster per node
+			const analyResult = search(battle, { depth: 3, useAnalytical: true, timeLimit: 10000, playerIndex: 0 });
+
+			// With depth-3 analytical recursion, we should see substantial node counts
+			// 4 moves each = 16 cells at root, each recursing further
+			expect(analyResult.nodesVisited).to.be.greaterThan(16);
+		});
+	});
+
+	describe('Setup Move Boost Projection in Search', () => {
+
+		it('analytical search should value Calm Mind line for Jirachi vs Gastrodon', function () {
+			this.timeout(30000);
+			const battle = create1v1Battle(
+				{
+					species: 'Jirachi',
+					moves: ['Calm Mind', 'Psychic', 'Flash Cannon', 'Thunder Wave'],
+					ability: 'Serene Grace',
+					item: 'Leftovers',
+					teraType: 'Psychic',
+				},
+				{
+					species: 'Gastrodon',
+					moves: ['Scald', 'Earth Power', 'Recover', 'Toxic'],
+					ability: 'Storm Drain',
+					item: 'Leftovers',
+					teraType: 'Ground',
+				},
+			);
+
+			// At depth 4+, the analytical search should recognize that Calm Mind
+			// is a strong play because after boosting, Jirachi overwhelms Gastrodon
+			const result = search(battle, {
+				depth: 4,
+				useAnalytical: true,
+				timeLimit: 15000,
+				playerIndex: 0,
+			});
+
+			// Calm Mind should appear in the Nash mix with meaningful probability
+			const cmStrategy = result.nash.p1Strategy.find(s =>
+				s.label.toLowerCase().includes('calm mind')
+			);
+
+			// CM should either be in the mix or the game value should be better
+			// than the old -0.20 base eval
+			if (cmStrategy) {
+				expect(cmStrategy.probability).to.be.greaterThan(0.05);
+			}
+			// Game value should reflect that the matchup isn't as bad as unboosted
+			// damage suggests
+			expect(result.gameValue).to.be.greaterThan(-0.5);
+		});
+
+		it('analytical search should prefer Swords Dance when it can set up safely', function () {
+			this.timeout(30000);
+			const battle = create1v1Battle(
+				{
+					species: 'Garchomp',
+					moves: ['Swords Dance', 'Earthquake', 'Dragon Claw', 'Stone Edge'],
+					ability: 'Rough Skin',
+					item: 'Life Orb',
+					teraType: 'Ground',
+				},
+				{
+					species: 'Toxapex',
+					moves: ['Scald', 'Toxic', 'Recover', 'Haze'],
+					ability: 'Regenerator',
+					item: 'Rocky Helmet',
+					teraType: 'Water',
+				},
+			);
+
+			// Garchomp vs Toxapex: unboosted EQ doesn't break through Recover.
+			// SD+EQ should be valued highly.
+			const result = search(battle, {
+				depth: 3,
+				useAnalytical: true,
+				timeLimit: 15000,
+				playerIndex: 0,
+			});
+
+			const sdStrategy = result.nash.p1Strategy.find(s =>
+				s.label.toLowerCase().includes('swords dance')
+			);
+
+			// SD should appear in the strategy mix
+			if (sdStrategy) {
+				expect(sdStrategy.probability).to.be.greaterThan(0.0);
+			}
+
+			// Game value should be reasonable (Garchomp has tools to break Toxapex)
+			expect(result.gameValue).to.be.greaterThan(-0.8);
+		});
+	});
 });

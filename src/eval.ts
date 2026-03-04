@@ -22,7 +22,7 @@ import {
 } from './state';
 import {
 	calcDamageWithCrit, getEffectiveSpeed, calcAllMoves,
-	getSpeedComparison,
+	getSpeedComparison, calcSetupTKO,
 } from './damage-calc';
 
 // ─── Weight Constants ───────────────────────────────────────────
@@ -192,8 +192,17 @@ function evaluateMatchup(
 	const p2EffDmg = p2BestDmg + p1Residual + p1NewResidual;
 
 	// Turns to KO (using effective damage per turn vs remaining HP)
-	const p1TKO = p1EffDmg > 0 ? Math.ceil(p2Active.hp / p1EffDmg) : Infinity;
-	const p2TKO = p2EffDmg > 0 ? Math.ceil(p1Active.hp / p2EffDmg) : Infinity;
+	let p1TKO = p1EffDmg > 0 ? Math.ceil(p2Active.hp / p1EffDmg) : Infinity;
+	let p2TKO = p2EffDmg > 0 ? Math.ceil(p1Active.hp / p2EffDmg) : Infinity;
+
+	// ─── Setup Move TKO Projection ─────────────────────────────
+	// If a mon has setup moves, compute the optimal setup+attack TKO.
+	// Only count setup as viable if the mon can survive long enough to set up.
+	const p1SetupTKO = computeSetupTKO(p1Active, p2Active, p2EffDmg, opts);
+	const p2SetupTKO = computeSetupTKO(p2Active, p1Active, p1EffDmg, opts);
+
+	if (p1SetupTKO < p1TKO) p1TKO = p1SetupTKO;
+	if (p2SetupTKO < p2TKO) p2TKO = p2SetupTKO;
 
 	// ─── Move-Order Effect: OHKO-before-action ───────────────────
 	// If we move first and OHKO, opponent's action is irrelevant → pure win
@@ -236,6 +245,148 @@ function findBestDamagingMove(mon: MonState): MoveInfo | null {
 		}
 	}
 	return best;
+}
+
+/**
+ * Compute the optimal setup+attack TKO for an attacker against a defender.
+ *
+ * Finds setup moves in the attacker's moveset (Calm Mind, Swords Dance, etc.)
+ * and evaluates whether setting up N times then attacking is faster than
+ * attacking immediately. Accounts for damage taken during setup turns.
+ *
+ * Returns the best setup TKO, or Infinity if setup isn't viable/beneficial.
+ *
+ * @param attacker - The mon considering setup
+ * @param defender - The opposing mon
+ * @param defenderDmgPerTurn - Expected damage the defender deals per turn
+ * @param opts - Calc options (field, etc.)
+ */
+function computeSetupTKO(
+	attacker: MonState,
+	defender: MonState,
+	defenderDmgPerTurn: number,
+	opts: { field: FieldState },
+): number {
+	// Find setup moves in attacker's moveset
+	const setupMoves = attacker.moves.filter(m =>
+		!m.disabled && m.pp > 0 && m.category === 'Status' &&
+		m.boosts && (m.target === 'self' || m.target === 'allies' || m.target === 'allyTeam')
+	);
+	if (setupMoves.length === 0) return Infinity;
+
+	// Find best attacking moves to use after setup
+	const attackMoves = attacker.moves.filter(m =>
+		!m.disabled && m.pp > 0 && m.category !== 'Status'
+	);
+	if (attackMoves.length === 0) return Infinity;
+
+	let bestTKO = Infinity;
+
+	for (const setupMove of setupMoves) {
+		if (!setupMove.boosts) continue;
+
+		// Determine which offensive stats are boosted
+		const boostsAtk = (setupMove.boosts as Record<string, number>).atk || 0;
+		const boostsSpa = (setupMove.boosts as Record<string, number>).spa || 0;
+		const boostsDef = (setupMove.boosts as Record<string, number>).def || 0;
+		const boostsSpd = (setupMove.boosts as Record<string, number>).spd || 0;
+		const boostsSpe = (setupMove.boosts as Record<string, number>).spe || 0;
+
+		// Only consider setups that boost offense or useful defense
+		if (boostsAtk <= 0 && boostsSpa <= 0 && boostsDef <= 0 && boostsSpd <= 0 && boostsSpe <= 0) continue;
+
+		for (const attackMove of attackMoves) {
+			// Use calcSetupTKO to find optimal setup count
+			const recoveryPerTurn = estimateDefenderRecovery(defender);
+			const result = calcSetupTKO(
+				attacker, defender, attackMove,
+				setupMove.boosts as Partial<Record<string, number>>,
+				recoveryPerTurn, opts,
+			);
+
+			if (!result.breaksThrough) continue;
+
+			// Account for damage taken during setup turns:
+			// During setupTurns, the attacker takes defenderDmgPerTurn each turn.
+			// Check if attacker survives long enough.
+			let setupTurns = result.setupTurns;
+			if (setupTurns > 0 && defenderDmgPerTurn > 0) {
+				const dmgDuringSetup = defenderDmgPerTurn * setupTurns;
+				if (dmgDuringSetup >= attacker.hp) {
+					// Can't survive the setup phase. Try fewer boosts.
+					const maxSurvivableTurns = Math.floor((attacker.hp - 1) / defenderDmgPerTurn);
+					if (maxSurvivableTurns <= 0) continue;
+					// Recompute with capped setup turns
+					setupTurns = maxSurvivableTurns;
+				}
+				// Adjust: attacker HP will be lower after setup, so it needs to
+				// survive the attack phase too. The total TKO from the defender's
+				// perspective includes setup turns + attack turns, so the attacker
+				// must survive that many turns of incoming damage.
+				const hpAfterSetup = attacker.hp - defenderDmgPerTurn * setupTurns;
+				if (hpAfterSetup <= 0) continue;
+
+				// Re-evaluate: with setupTurns boosts, how many attack turns?
+				const boosted = { ...attacker, boosts: { ...attacker.boosts } };
+				for (const [stat, boost] of Object.entries(setupMove.boosts as Record<string, number>)) {
+					const key = stat as keyof typeof boosted.boosts;
+					if (key in boosted.boosts) {
+						boosted.boosts[key] = Math.min(6, (boosted.boosts[key] || 0) + boost * setupTurns);
+					}
+				}
+				const dmgResult = calcDamageWithCrit(boosted, defender, attackMove, opts);
+				const netDmg = dmgResult.expectedWithAccuracy - recoveryPerTurn;
+				if (netDmg <= 0) continue;
+
+				const attackTurns = Math.ceil(defender.hp / netDmg);
+				const totalTurns = setupTurns + attackTurns;
+
+				// Also verify attacker survives the attack phase
+				const totalDmgTaken = defenderDmgPerTurn * totalTurns;
+				if (totalDmgTaken >= attacker.hp) {
+					// Won't survive to finish attacking. Still might be better than
+					// the unboosted TKO if it's close.
+					continue;
+				}
+
+				if (totalTurns < bestTKO) bestTKO = totalTurns;
+			} else {
+				// Defender deals no damage (we can set up for free)
+				if (result.turnsToKO < bestTKO) bestTKO = result.turnsToKO;
+			}
+		}
+	}
+
+	return bestTKO;
+}
+
+/**
+ * Estimate defender's per-turn recovery (Leftovers, Recover usage, etc.).
+ * Used for setup TKO calculation.
+ */
+function estimateDefenderRecovery(defender: MonState): number {
+	let recovery = 0;
+
+	// Leftovers/Black Sludge: 1/16 maxHP
+	if (defender.itemId === 'leftovers' ||
+		(defender.itemId === 'blacksludge' && defender.types.includes('Poison'))) {
+		recovery += Math.floor(defender.maxhp / 16);
+	}
+
+	// Check for healing moves (Recover, Roost, etc.)
+	// If the defender has a reliable recovery move, estimate 50% chance they use it
+	// each turn → 0.5 * healAmount
+	for (const move of defender.moves) {
+		if (move.disabled || move.pp <= 0) continue;
+		if (move.heal) {
+			const healAmount = Math.floor(defender.maxhp * move.heal[0] / move.heal[1]);
+			// Weight: 50% usage rate (they might attack instead)
+			recovery += healAmount * 0.5;
+			break; // Only count one healing move
+		}
+	}
+
+	return recovery;
 }
 
 /**

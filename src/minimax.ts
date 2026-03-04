@@ -39,6 +39,15 @@ const MAX_CHOICES_PER_SIDE = 8;
 /** Threshold below which a strategy probability is considered negligible */
 const STRATEGY_EPSILON = 0.01;
 
+/** Eval threshold for early termination — position is decisive */
+const DECISIVE_EVAL = 0.8;
+
+/** Max branching per side in deeper analytical recursion (tighter than root) */
+const ANALYTICAL_DEEP_MAX_CHOICES = 4;
+
+/** Default depth for analytical mode (deeper because it's fast) */
+const DEFAULT_ANALYTICAL_DEPTH = 5;
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface SearchOptions {
@@ -52,6 +61,18 @@ export interface SearchOptions {
 	 *  Much faster (~100x), enables deeper search, but less accurate for
 	 *  complex interactions. Default false (use sim-based). */
 	useAnalytical?: boolean;
+	/** Enable forfeit detection. If eval < this threshold at 3v3 or worse
+	 *  mon count disadvantage, flag the position as practically lost.
+	 *  Default: -0.7 */
+	forfeitThreshold?: number;
+}
+
+/** Result of forfeit detection check */
+export interface ForfeitInfo {
+	shouldForfeit: boolean;
+	eval: number;
+	monCountDiff: number;  // negative = we have fewer mons
+	reason: string;
 }
 
 export interface SearchResult {
@@ -67,6 +88,8 @@ export interface SearchResult {
 	turn: number;
 	/** Stats for debugging */
 	nodesVisited: number;
+	/** Forfeit detection result (if enabled) */
+	forfeit?: ForfeitInfo;
 }
 
 // ─── Internal tracking ──────────────────────────────────────────
@@ -91,16 +114,21 @@ function isTimeUp(): boolean {
  * @returns SearchResult with Nash strategy, game value, and lines
  */
 export function search(battle: Battle, options: SearchOptions = {}): SearchResult {
-	const depth = options.depth ?? DEFAULT_DEPTH;
+	const useAnalytical = options.useAnalytical ?? false;
+	const depth = options.depth ?? (useAnalytical ? DEFAULT_ANALYTICAL_DEPTH : DEFAULT_DEPTH);
 	const shadow = options.shadow;
 	const playerIndex = options.playerIndex ?? 0;
 
 	nodesVisited = 0;
 	startTime = Date.now();
 	timeLimitMs = options.timeLimit ?? 0;
-	analyticalMode = options.useAnalytical ?? false;
+	analyticalMode = useAnalytical;
 
 	const turn = getCurrentTurn(battle);
+
+	// ─── Forfeit detection ──────────────────────────────────────
+	const forfeitThreshold = options.forfeitThreshold ?? -0.7;
+	const forfeit = checkForfeit(battle, shadow, playerIndex, forfeitThreshold);
 
 	// Get choices for both sides
 	const p1Choices = getChoices(battle, 0);
@@ -109,11 +137,15 @@ export function search(battle: Battle, options: SearchOptions = {}): SearchResul
 	// Handle force-switch (single player node)
 	if (p1Choices.length > 0 && p2Choices.length === 0) {
 		// Only P1 chooses (P2 is waiting/forced)
-		return searchSinglePlayer(battle, p1Choices, 0, depth, shadow, playerIndex, turn);
+		const result = searchSinglePlayer(battle, p1Choices, 0, depth, shadow, playerIndex, turn);
+		result.forfeit = forfeit;
+		return result;
 	}
 	if (p2Choices.length > 0 && p1Choices.length === 0) {
 		// Only P2 chooses
-		return searchSinglePlayer(battle, p2Choices, 1, depth, shadow, playerIndex, turn);
+		const result = searchSinglePlayer(battle, p2Choices, 1, depth, shadow, playerIndex, turn);
+		result.forfeit = forfeit;
+		return result;
 	}
 
 	if (p1Choices.length === 0 && p2Choices.length === 0) {
@@ -126,6 +158,7 @@ export function search(battle: Battle, options: SearchOptions = {}): SearchResul
 			conditionalPlans: [],
 			turn,
 			nodesVisited: 1,
+			forfeit,
 		};
 	}
 
@@ -157,7 +190,43 @@ export function search(battle: Battle, options: SearchOptions = {}): SearchResul
 		conditionalPlans,
 		turn,
 		nodesVisited,
+		forfeit,
 	};
+}
+
+// ─── Forfeit Detection ──────────────────────────────────────────
+
+/**
+ * Check if the position is so bad that forfeiting is reasonable.
+ * Criteria: eval < threshold AND at a 3+ mon count disadvantage.
+ */
+export function checkForfeit(
+	battle: Battle,
+	shadow: ShadowTeam | undefined,
+	playerIndex: number,
+	threshold: number,
+): ForfeitInfo {
+	const eval_ = evaluate(battle, shadow);
+	const perspectiveEval = playerIndex === 0 ? eval_ : -eval_;
+
+	const p1Side = extractSideState(battle, 0);
+	const p2Side = extractSideState(battle, 1);
+	const p1Alive = p1Side.filter(m => !m.fainted).length;
+	const p2Alive = p2Side.filter(m => !m.fainted).length;
+
+	const ourAlive = playerIndex === 0 ? p1Alive : p2Alive;
+	const theirAlive = playerIndex === 0 ? p2Alive : p1Alive;
+	const monCountDiff = ourAlive - theirAlive;
+
+	// Need both a bad eval AND a mon count disadvantage
+	const shouldForfeit = perspectiveEval < threshold && monCountDiff <= -2;
+
+	let reason = '';
+	if (shouldForfeit) {
+		reason = `eval=${perspectiveEval.toFixed(3)}, ${ourAlive}v${theirAlive} disadvantage`;
+	}
+
+	return { shouldForfeit, eval: perspectiveEval, monCountDiff, reason };
 }
 
 // ─── Payoff Matrix Construction ──────────────────────────────────
@@ -238,6 +307,10 @@ function buildPayoffMatrix(
  *
  * 4. SWITCH vs MOVE: Mirror of MOVE vs SWITCH.
  *
+ * When remainingDepth > 0, each cell projects the post-turn state and
+ * recursively builds another payoff matrix from the projected state.
+ * This enables depth 5+ search on the analytical fast-path.
+ *
  * The value is expressed from P1's perspective in [-1, 1] to match the
  * sim-based matrix format.
  */
@@ -270,12 +343,28 @@ export function buildAnalyticalPayoffMatrix(
 			}
 
 			nodesVisited++;
-			payoffs[i][j] = evaluateAnalyticalCell(
+
+			// Compute single-turn cell value
+			const cellVal = evaluateAnalyticalCell(
 				p1Choices[i], p2Choices[j],
 				p1Active, p2Active,
 				p1Side, p2Side,
 				field, baseEval, shadow,
 			);
+
+			// If we have remaining depth and the position isn't decisive,
+			// project the post-turn state and recurse
+			if (remainingDepth > 0 && Math.abs(cellVal) < DECISIVE_EVAL && !isTimeUp()) {
+				payoffs[i][j] = analyticalRecurse(
+					p1Choices[i], p2Choices[j],
+					p1Active, p2Active,
+					p1Side, p2Side,
+					field, cellVal, shadow,
+					remainingDepth,
+				);
+			} else {
+				payoffs[i][j] = cellVal;
+			}
 		}
 	}
 
@@ -338,6 +427,728 @@ export function evaluateAnalyticalCell(
 	);
 }
 
+// ─── Analytical Recursion Engine ─────────────────────────────────
+
+/**
+ * Project the post-turn state after a (p1Choice, p2Choice) pair and
+ * recursively evaluate it. This enables multi-turn lookahead on the
+ * analytical fast-path without needing Battle clones.
+ *
+ * State projection:
+ * - MOVE vs MOVE: Update HP based on computed damage, apply status
+ * - MOVE vs SWITCH: Update switch-in HP, set new active
+ * - SWITCH vs SWITCH: Set new actives
+ *
+ * If a mon is KO'd, the recursion for that player becomes a single-player
+ * "force-switch" where they pick from remaining bench mons.
+ */
+function analyticalRecurse(
+	p1Choice: Choice,
+	p2Choice: Choice,
+	p1Active: MonState | null,
+	p2Active: MonState | null,
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+	cellVal: number,
+	shadow: ShadowTeam | undefined,
+	remainingDepth: number,
+): number {
+	if (!p1Active || !p2Active) return cellVal;
+
+	const p1IsMove = p1Choice.type === 'move';
+	const p2IsMove = p2Choice.type === 'move';
+
+	// Project the post-turn state
+	const projected = projectPostTurnState(
+		p1Choice, p2Choice, p1Active, p2Active, p1Side, p2Side, field,
+	);
+
+	if (!projected) return cellVal;
+
+	const { newP1Active, newP2Active, newP1Side, newP2Side } = projected;
+
+	// If both fainted — it's a wash, no further recursion
+	if (!newP1Active && !newP2Active) return cellVal;
+
+	// If one side fainted, the other gets a free turn → force-switch recursion
+	if (!newP1Active && newP2Active) {
+		// P1 fainted: P1 must switch in from bench (single-player min for P1's perspective)
+		const p1Bench = newP1Side.filter(m => !m.fainted && !m.isActive);
+		if (p1Bench.length === 0) return clamp(cellVal - 0.2); // no bench → losing
+		return analyticalForceSwitchMin(
+			p1Bench, newP2Active, newP1Side, newP2Side, field, cellVal, shadow, remainingDepth - 1,
+		);
+	}
+
+	if (newP1Active && !newP2Active) {
+		// P2 fainted: P2 must switch in (single-player max for P1's perspective)
+		const p2Bench = newP2Side.filter(m => !m.fainted && !m.isActive);
+		if (p2Bench.length === 0) return clamp(cellVal + 0.2); // no bench → winning
+		return analyticalForceSwitchMax(
+			newP1Active, p2Bench, newP1Side, newP2Side, field, cellVal, shadow, remainingDepth - 1,
+		);
+	}
+
+	// Both alive: build a new analytical payoff matrix for the projected state
+	return analyticalSimultaneousMove(
+		newP1Active!, newP2Active!, newP1Side, newP2Side, field, cellVal, shadow, remainingDepth - 1,
+	);
+}
+
+/**
+ * Project the post-turn state after executing a (p1Choice, p2Choice) pair.
+ * Returns the new actives and sides, or null if projection fails.
+ */
+function projectPostTurnState(
+	p1Choice: Choice,
+	p2Choice: Choice,
+	p1Active: MonState,
+	p2Active: MonState,
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+): { newP1Active: MonState | null; newP2Active: MonState | null;
+     newP1Side: MonState[]; newP2Side: MonState[] } | null {
+
+	const p1IsMove = p1Choice.type === 'move';
+	const p2IsMove = p2Choice.type === 'move';
+
+	// ─── SWITCH cases ───────────────────────────────────────────
+
+	if (!p1IsMove && !p2IsMove) {
+		// Both switch
+		const p1SwitchIn = findSwitchTarget(p1Side, p1Choice);
+		const p2SwitchIn = findSwitchTarget(p2Side, p2Choice);
+		if (!p1SwitchIn || !p2SwitchIn) return null;
+
+		const newP1Active = cloneMonState(p1SwitchIn, true);
+		const newP2Active = cloneMonState(p2SwitchIn, true);
+		const newP1Side = updateSideForSwitch(p1Side, p1Active, p1SwitchIn);
+		const newP2Side = updateSideForSwitch(p2Side, p2Active, p2SwitchIn);
+
+		return { newP1Active, newP2Active, newP1Side, newP2Side };
+	}
+
+	if (p1IsMove && !p2IsMove) {
+		// P1 attacks, P2 switches → P1 hits the switch-in
+		const p2SwitchIn = findSwitchTarget(p2Side, p2Choice);
+		if (!p2SwitchIn) return null;
+
+		const move = getMoveFromChoice(p1Active, p1Choice);
+		if (!move || move.category === 'Status') {
+			// Status move on switch-in: apply boost effects but no HP change
+			const newP1Active = cloneMonState(p1Active, true);
+			const newP2Active = cloneMonState(p2SwitchIn, true);
+			if (move) applyMoveBoosts(newP1Active, newP2Active, move);
+			const newP2Side = updateSideForSwitch(p2Side, p2Active, p2SwitchIn);
+			return {
+				newP1Active,
+				newP2Active,
+				newP1Side: cloneSide(p1Side, newP1Active),
+				newP2Side,
+			};
+		}
+
+		const dmg = calcDamageWithCrit(p1Active, p2SwitchIn, move, {
+			field, defenderJustSwitched: true,
+		});
+		const hpAfter = Math.max(0, p2SwitchIn.hp - dmg.expectedWithAccuracy);
+		const newP1Active = cloneMonState(p1Active, true);
+		const newP2Active = cloneMonState(p2SwitchIn, true);
+		newP2Active.hp = hpAfter;
+		if (hpAfter <= 0) newP2Active.fainted = true;
+
+		// Apply self-boost side effects (e.g., Close Combat -1 Def/SpD)
+		applyMoveBoosts(newP1Active, newP2Active, move);
+
+		const newP2Side = updateSideForSwitch(p2Side, p2Active, p2SwitchIn);
+		// Update the switch-in's HP in the side array too
+		updateSideMonHP(newP2Side, newP2Active);
+
+		return {
+			newP1Active,
+			newP2Active: hpAfter > 0 ? newP2Active : null,
+			newP1Side: cloneSide(p1Side, newP1Active),
+			newP2Side,
+		};
+	}
+
+	if (!p1IsMove && p2IsMove) {
+		// P2 attacks, P1 switches → P2 hits the switch-in
+		const p1SwitchIn = findSwitchTarget(p1Side, p1Choice);
+		if (!p1SwitchIn) return null;
+
+		const move = getMoveFromChoice(p2Active, p2Choice);
+		if (!move || move.category === 'Status') {
+			const newP1Active = cloneMonState(p1SwitchIn, true);
+			const newP2Active = cloneMonState(p2Active, true);
+			if (move) applyMoveBoosts(newP2Active, newP1Active, move);
+			const newP1Side = updateSideForSwitch(p1Side, p1Active, p1SwitchIn);
+			return {
+				newP1Active,
+				newP2Active,
+				newP1Side,
+				newP2Side: cloneSide(p2Side, newP2Active),
+			};
+		}
+
+		const dmg = calcDamageWithCrit(p2Active, p1SwitchIn, move, {
+			field, defenderJustSwitched: true,
+		});
+		const hpAfter = Math.max(0, p1SwitchIn.hp - dmg.expectedWithAccuracy);
+		const newP1Active = cloneMonState(p1SwitchIn, true);
+		newP1Active.hp = hpAfter;
+		if (hpAfter <= 0) newP1Active.fainted = true;
+		const newP2Active = cloneMonState(p2Active, true);
+
+		// Apply self-boost side effects (e.g., Close Combat -1 Def/SpD)
+		applyMoveBoosts(newP2Active, newP1Active, move);
+
+		const newP1Side = updateSideForSwitch(p1Side, p1Active, p1SwitchIn);
+		updateSideMonHP(newP1Side, newP1Active);
+
+		return {
+			newP1Active: hpAfter > 0 ? newP1Active : null,
+			newP2Active,
+			newP1Side,
+			newP2Side: cloneSide(p2Side, newP2Active),
+		};
+	}
+
+	// ─── MOVE vs MOVE ───────────────────────────────────────────
+
+	const p1Move = getMoveFromChoice(p1Active, p1Choice);
+	const p2Move = getMoveFromChoice(p2Active, p2Choice);
+	if (!p1Move || !p2Move) return null;
+
+	const speedResult = getSpeedComparison(p1Active, p1Move, p2Active, p2Move, field);
+
+	let p1Dmg = calcDamageWithCrit(p1Active, p2Active, p1Move, { field });
+	let p2Dmg = calcDamageWithCrit(p2Active, p1Active, p2Move, { field });
+	let p1ExpDmg = p1Dmg.expectedWithAccuracy;
+	let p2ExpDmg = p2Dmg.expectedWithAccuracy;
+
+	// Focus Sash / Sturdy checks
+	const p2HasSash = (p2Active.itemId === 'focussash' || p2Active.abilityId === 'sturdy') && p2Active.hp === p2Active.maxhp;
+	const p1HasSash = (p1Active.itemId === 'focussash' || p1Active.abilityId === 'sturdy') && p1Active.hp === p1Active.maxhp;
+
+	// Move-order adjustments (same logic as evaluateAnalyticalMoveMove)
+	if (speedResult.faster === 'p1') {
+		if (p1ExpDmg >= p2Active.hp && p2HasSash && p1Move.category !== 'Status') {
+			p1ExpDmg = p2Active.hp - 1;
+		} else if (p1ExpDmg >= p2Active.hp) {
+			// OHKO — P2 doesn't act
+			p2ExpDmg = 0;
+		}
+		p2ExpDmg = applyPreMoveStatusEffect(p1Move, p1Active, p2Active, p2Move, p2ExpDmg);
+	} else if (speedResult.faster === 'p2') {
+		if (p2ExpDmg >= p1Active.hp && p1HasSash && p2Move.category !== 'Status') {
+			p2ExpDmg = p1Active.hp - 1;
+		} else if (p2ExpDmg >= p1Active.hp) {
+			p1ExpDmg = 0;
+		}
+		p1ExpDmg = applyPreMoveStatusEffect(p2Move, p2Active, p1Active, p1Move, p1ExpDmg);
+	}
+
+	// Final Sash caps for speed-tie
+	if (p2HasSash && p1ExpDmg >= p2Active.hp && p1Move.category !== 'Status') {
+		p1ExpDmg = p2Active.hp - 1;
+	}
+	if (p1HasSash && p2ExpDmg >= p1Active.hp && p2Move.category !== 'Status') {
+		p2ExpDmg = p1Active.hp - 1;
+	}
+
+	let p1HPAfter = Math.max(0, p1Active.hp - p2ExpDmg);
+	let p2HPAfter = Math.max(0, p2Active.hp - p1ExpDmg);
+
+	// ─── Healing move recovery ──────────────────────────────
+	// Recover, Roost, etc.: heal [numerator, denominator] of maxHP
+	if (p1HPAfter > 0 && p1Move.heal) {
+		const healAmount = Math.floor(p1Active.maxhp * p1Move.heal[0] / p1Move.heal[1]);
+		p1HPAfter = Math.min(p1Active.maxhp, p1HPAfter + healAmount);
+	}
+	if (p2HPAfter > 0 && p2Move.heal) {
+		const healAmount = Math.floor(p2Active.maxhp * p2Move.heal[0] / p2Move.heal[1]);
+		p2HPAfter = Math.min(p2Active.maxhp, p2HPAfter + healAmount);
+	}
+
+	// ─── Drain move recovery ────────────────────────────────
+	// Draining Kiss, Giga Drain, etc.: heal [numerator, denominator] of damage dealt
+	if (p1HPAfter > 0 && p1Move.drain && p1ExpDmg > 0) {
+		const drainHeal = Math.floor(Math.min(p1ExpDmg, p2Active.hp) * p1Move.drain[0] / p1Move.drain[1]);
+		p1HPAfter = Math.min(p1Active.maxhp, p1HPAfter + drainHeal);
+	}
+	if (p2HPAfter > 0 && p2Move.drain && p2ExpDmg > 0) {
+		const drainHeal = Math.floor(Math.min(p2ExpDmg, p1Active.hp) * p2Move.drain[0] / p2Move.drain[1]);
+		p2HPAfter = Math.min(p2Active.maxhp, p2HPAfter + drainHeal);
+	}
+
+	// ─── Recoil damage ──────────────────────────────────────
+	// Brave Bird, Flare Blitz, etc.: recoil [numerator, denominator] of damage dealt
+	if (p1HPAfter > 0 && p1Move.recoil && p1ExpDmg > 0) {
+		const recoilDmg = Math.floor(Math.min(p1ExpDmg, p2Active.hp) * p1Move.recoil[0] / p1Move.recoil[1]);
+		p1HPAfter = Math.max(0, p1HPAfter - recoilDmg);
+	}
+	if (p2HPAfter > 0 && p2Move.recoil && p2ExpDmg > 0) {
+		const recoilDmg = Math.floor(Math.min(p2ExpDmg, p1Active.hp) * p2Move.recoil[0] / p2Move.recoil[1]);
+		p2HPAfter = Math.max(0, p2HPAfter - recoilDmg);
+	}
+
+	// End-of-turn residuals
+	if (p1HPAfter > 0 && (p1Active.itemId === 'leftovers' ||
+		(p1Active.itemId === 'blacksludge' && p1Active.types.includes('Poison')))) {
+		p1HPAfter = Math.min(p1Active.maxhp, p1HPAfter + Math.floor(p1Active.maxhp / 16));
+	}
+	if (p2HPAfter > 0 && (p2Active.itemId === 'leftovers' ||
+		(p2Active.itemId === 'blacksludge' && p2Active.types.includes('Poison')))) {
+		p2HPAfter = Math.min(p2Active.maxhp, p2HPAfter + Math.floor(p2Active.maxhp / 16));
+	}
+	if (p2HPAfter > 0 && p2Active.itemId === 'rockyhelmet' &&
+		p1Move.category !== 'Status' && p1Move.flags?.['contact']) {
+		p1HPAfter = Math.max(0, p1HPAfter - Math.floor(p1Active.maxhp / 6));
+	}
+	if (p1HPAfter > 0 && p1Active.itemId === 'rockyhelmet' &&
+		p2Move.category !== 'Status' && p2Move.flags?.['contact']) {
+		p2HPAfter = Math.max(0, p2HPAfter - Math.floor(p2Active.maxhp / 6));
+	}
+
+	// Project new MonStates
+	const newP1Active = cloneMonState(p1Active, true);
+	newP1Active.hp = p1HPAfter;
+	if (p1HPAfter <= 0) newP1Active.fainted = true;
+
+	const newP2Active = cloneMonState(p2Active, true);
+	newP2Active.hp = p2HPAfter;
+	if (p2HPAfter <= 0) newP2Active.fainted = true;
+
+	// ─── Apply boost changes from moves ─────────────────────
+	// Setup moves (target=self): Calm Mind, Swords Dance, etc. → boost user
+	// Attacking moves with self-effect: Close Combat → degrade user
+	// Opponent-targeting stat moves: Charm, Screech → degrade target
+	if (p1HPAfter > 0) {
+		applyMoveBoosts(newP1Active, newP2Active, p1Move);
+	}
+	if (p2HPAfter > 0) {
+		applyMoveBoosts(newP2Active, newP1Active, p2Move);
+	}
+
+	const newP1Side = cloneSide(p1Side, newP1Active);
+	const newP2Side = cloneSide(p2Side, newP2Active);
+
+	return {
+		newP1Active: p1HPAfter > 0 ? newP1Active : null,
+		newP2Active: p2HPAfter > 0 ? newP2Active : null,
+		newP1Side,
+		newP2Side,
+	};
+}
+
+/**
+ * Analytical simultaneous-move recursion.
+ * Both actives are alive. Build a mini payoff matrix from their movesets
+ * and solve Nash.
+ */
+function analyticalSimultaneousMove(
+	p1Active: MonState,
+	p2Active: MonState,
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+	baseEval: number,
+	shadow: ShadowTeam | undefined,
+	remainingDepth: number,
+): number {
+	if (isTimeUp()) return baseEval;
+
+	// Generate choices from movesets
+	const p1Choices = generateAnalyticalChoices(p1Active, p1Side);
+	const p2Choices = generateAnalyticalChoices(p2Active, p2Side);
+
+	if (p1Choices.length === 0 || p2Choices.length === 0) return baseEval;
+
+	// At deeper levels, trim more aggressively
+	const maxChoices = remainingDepth >= 2 ? ANALYTICAL_DEEP_MAX_CHOICES : MAX_CHOICES_PER_SIDE;
+	const trimP1 = trimAnalyticalChoices(p1Active, p2Active, p1Choices, field, maxChoices);
+	const trimP2 = trimAnalyticalChoices(p2Active, p1Active, p2Choices, field, maxChoices);
+
+	// Build payoff matrix for this projected state
+	const payoffs: number[][] = [];
+	for (let i = 0; i < trimP1.length; i++) {
+		payoffs[i] = [];
+		for (let j = 0; j < trimP2.length; j++) {
+			if (isTimeUp()) {
+				payoffs[i][j] = baseEval;
+				continue;
+			}
+			nodesVisited++;
+
+			const cellVal = evaluateAnalyticalCell(
+				trimP1[i], trimP2[j],
+				p1Active, p2Active,
+				p1Side, p2Side,
+				field, baseEval, shadow,
+			);
+
+			// Recurse deeper if depth remains and position isn't decisive
+			if (remainingDepth > 0 && Math.abs(cellVal) < DECISIVE_EVAL && !isTimeUp()) {
+				payoffs[i][j] = analyticalRecurse(
+					trimP1[i], trimP2[j],
+					p1Active, p2Active,
+					p1Side, p2Side,
+					field, cellVal, shadow,
+					remainingDepth,
+				);
+			} else {
+				payoffs[i][j] = cellVal;
+			}
+		}
+	}
+
+	const matrix: GameMatrix = {
+		payoffs,
+		p1Labels: trimP1.map(c => c.label),
+		p2Labels: trimP2.map(c => c.label),
+		p1Choices: trimP1.map(c => c.choiceString),
+		p2Choices: trimP2.map(c => c.choiceString),
+	};
+
+	const nash = solveNash(matrix);
+	return nash.gameValue;
+}
+
+/**
+ * Analytical force-switch where P1 lost their active.
+ * P1 picks from bench, P2 stays in. Minimize P1's value (since P1 is choosing
+ * and the position is from P1's perspective — P1 wants to maximize, but the
+ * resulting matchup starts unfavorable because they just lost a mon).
+ *
+ * With alpha-beta: we can prune when we find a value >= beta (for P1 max).
+ */
+function analyticalForceSwitchMin(
+	p1Bench: MonState[],
+	p2Active: MonState,
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+	baseEval: number,
+	shadow: ShadowTeam | undefined,
+	remainingDepth: number,
+): number {
+	if (isTimeUp() || p1Bench.length === 0) return baseEval;
+
+	// P1 picks best switch-in to maximize their eval
+	let best = -Infinity;
+
+	for (const switchIn of p1Bench) {
+		nodesVisited++;
+		const newP1Active = cloneMonState(switchIn, true);
+		const newP1Side = p1Side.map(m =>
+			m.position === switchIn.position ? newP1Active : cloneMonState(m, m.isActive)
+		);
+
+		let val: number;
+		if (remainingDepth > 0 && Math.abs(baseEval) < DECISIVE_EVAL && !isTimeUp()) {
+			val = analyticalSimultaneousMove(
+				newP1Active, p2Active, newP1Side, p2Side,
+				field, baseEval, shadow, remainingDepth - 1,
+			);
+		} else {
+			// Leaf: evaluate the matchup
+			val = evaluateProjectedMatchup(newP1Active, p2Active, field, baseEval);
+		}
+
+		if (val > best) best = val;
+	}
+
+	return best === -Infinity ? baseEval : best;
+}
+
+/**
+ * Analytical force-switch where P2 lost their active.
+ * P2 picks from bench, P1 stays in. P2 minimizes P1's value.
+ */
+function analyticalForceSwitchMax(
+	p1Active: MonState,
+	p2Bench: MonState[],
+	p1Side: MonState[],
+	p2Side: MonState[],
+	field: FieldState,
+	baseEval: number,
+	shadow: ShadowTeam | undefined,
+	remainingDepth: number,
+): number {
+	if (isTimeUp() || p2Bench.length === 0) return baseEval;
+
+	// P2 picks best switch-in to minimize P1's eval (worst for P1)
+	let worst = Infinity;
+
+	for (const switchIn of p2Bench) {
+		nodesVisited++;
+		const newP2Active = cloneMonState(switchIn, true);
+		const newP2Side = p2Side.map(m =>
+			m.position === switchIn.position ? newP2Active : cloneMonState(m, m.isActive)
+		);
+
+		let val: number;
+		if (remainingDepth > 0 && Math.abs(baseEval) < DECISIVE_EVAL && !isTimeUp()) {
+			val = analyticalSimultaneousMove(
+				p1Active, newP2Active, p1Side, newP2Side,
+				field, baseEval, shadow, remainingDepth - 1,
+			);
+		} else {
+			val = evaluateProjectedMatchup(p1Active, newP2Active, field, baseEval);
+		}
+
+		if (val < worst) worst = val;
+	}
+
+	return worst === Infinity ? baseEval : worst;
+}
+
+/**
+ * Evaluate a projected matchup between two active mons.
+ * Used as leaf evaluation in analytical recursion.
+ * Considers TKO differential, speed, type matchup.
+ */
+function evaluateProjectedMatchup(
+	p1Active: MonState,
+	p2Active: MonState,
+	field: FieldState,
+	baseEval: number,
+): number {
+	const p1BestDmg = findBestMoveForMatchup(p1Active, p2Active, field);
+	const p2BestDmg = findBestMoveForMatchup(p2Active, p1Active, field);
+
+	const p1Dmg = p1BestDmg?.expectedWithAccuracy ?? 0;
+	const p2Dmg = p2BestDmg?.expectedWithAccuracy ?? 0;
+
+	const p1TKO = p1Dmg > 0 ? Math.ceil(p2Active.hp / p1Dmg) : Infinity;
+	const p2TKO = p2Dmg > 0 ? Math.ceil(p1Active.hp / p2Dmg) : Infinity;
+
+	if (p1TKO === Infinity && p2TKO === Infinity) return baseEval;
+	if (p1TKO === Infinity) return clamp(baseEval - 0.15);
+	if (p2TKO === Infinity) return clamp(baseEval + 0.15);
+
+	const tkoAdvantage = (p2TKO - p1TKO) / 3;
+
+	// HP ratio bonus (current HP matters for projected states)
+	const p1HPRatio = p1Active.hp / p1Active.maxhp;
+	const p2HPRatio = p2Active.hp / p2Active.maxhp;
+	const hpBonus = (p1HPRatio - p2HPRatio) * 0.1;
+
+	return clamp(baseEval + tkoAdvantage * 0.2 + hpBonus);
+}
+
+// ─── Analytical State Helpers ────────────────────────────────────
+
+/**
+ * Generate legal choices from a MonState's moveset + bench for analytical mode.
+ * Returns move choices for non-disabled moves + switch choices for alive bench mons.
+ */
+function generateAnalyticalChoices(mon: MonState, side: MonState[]): Choice[] {
+	const choices: Choice[] = [];
+
+	// Move choices
+	for (let i = 0; i < mon.moves.length; i++) {
+		const move = mon.moves[i];
+		if (move.disabled || move.pp <= 0) continue;
+		choices.push({
+			choiceString: `move ${i + 1}`,
+			label: move.name,
+			type: 'move',
+			moveIndex: i,
+		});
+	}
+
+	// Switch choices (alive, non-active bench mons)
+	for (const benchMon of side) {
+		if (benchMon.fainted || benchMon.isActive) continue;
+		choices.push({
+			choiceString: `switch ${benchMon.position + 1}`,
+			label: `Switch to ${benchMon.species}`,
+			type: 'switch',
+			switchIndex: benchMon.position + 1,
+		});
+	}
+
+	return choices;
+}
+
+/**
+ * Trim analytical choices, keeping the most promising moves.
+ * Sorts damaging moves by expected damage vs the opponent, keeps top N.
+ * Always keeps at least one switch option if available.
+ */
+function trimAnalyticalChoices(
+	attacker: MonState,
+	defender: MonState,
+	choices: Choice[],
+	field: FieldState,
+	maxChoices: number,
+): Choice[] {
+	if (choices.length <= maxChoices) return choices;
+
+	const moves = choices.filter(c => c.type === 'move');
+	const switches = choices.filter(c => c.type === 'switch');
+
+	// Score moves by expected damage
+	const scoredMoves = moves.map(choice => {
+		const move = getMoveFromChoice(attacker, choice);
+		if (!move || move.category === 'Status') {
+			return { choice, score: move ? 0.5 : 0 }; // status moves get moderate priority
+		}
+		const dmg = calcDamageWithCrit(attacker, defender, move, { field });
+		return { choice, score: dmg.expectedWithAccuracy / defender.maxhp };
+	}).sort((a, b) => b.score - a.score);
+
+	// Keep top moves + at most 1 switch
+	const kept: Choice[] = [];
+	const moveSlots = switches.length > 0 ? maxChoices - 1 : maxChoices;
+	for (let i = 0; i < Math.min(moveSlots, scoredMoves.length); i++) {
+		kept.push(scoredMoves[i].choice);
+	}
+	if (switches.length > 0) {
+		kept.push(switches[0]); // just keep the first switch option
+	}
+
+	return kept.length > 0 ? kept : choices.slice(0, maxChoices);
+}
+
+// ─── Boost Projection ──────────────────────────────────────────
+
+/** Stat keys that can be boosted */
+const BOOST_STATS = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion'] as const;
+
+/**
+ * Apply boost changes from a move to the user and/or target.
+ *
+ * Three sources of boosts:
+ * 1. move.boosts + target='self'/'allies' → self-boost (Calm Mind, SD, DD, etc.)
+ * 2. move.boosts + target='normal' → targets opponent (Charm, Screech, etc.)
+ * 3. move.selfBoost → self side-effect on attacking moves (Close Combat, Superpower)
+ *
+ * Boosts are clamped to [-6, +6] per stat.
+ * Contrary is handled (reverses all boost changes).
+ */
+function applyMoveBoosts(
+	user: MonState,
+	target: MonState,
+	move: MoveInfo,
+): void {
+	const isContrary = user.abilityId === 'contrary';
+
+	// 1. move.boosts — depends on move.target
+	if (move.boosts) {
+		const isSelfTarget = move.target === 'self' || move.target === 'allies' ||
+			move.target === 'allySide' || move.target === 'allyTeam';
+
+		if (isSelfTarget) {
+			// Setup move: boost the user
+			applyBoostTable(user, move.boosts, isContrary);
+		} else {
+			// Opponent-targeting: boost the target (usually negative)
+			// Check accuracy: if the move can miss, don't guarantee the debuff
+			// For projection purposes, we apply it (the payoff cell already
+			// accounts for accuracy in damage; debuffs are similarly expected-value)
+			const targetIsContrary = target.abilityId === 'contrary';
+			applyBoostTable(target, move.boosts, targetIsContrary);
+		}
+	}
+
+	// 2. move.selfBoost — attacking moves with self side-effects
+	if (move.selfBoost) {
+		applyBoostTable(user, move.selfBoost, isContrary);
+	}
+}
+
+/**
+ * Apply a partial boost table to a MonState's boosts, clamping to [-6, +6].
+ * If contrary is true, all boost values are negated before applying.
+ */
+function applyBoostTable(
+	mon: MonState,
+	boosts: Partial<Record<string, number>>,
+	contrary: boolean,
+): void {
+	for (const stat of BOOST_STATS) {
+		const val = boosts[stat];
+		if (val === undefined) continue;
+		const effective = contrary ? -val : val;
+		const key = stat as keyof typeof mon.boosts;
+		if (key in mon.boosts) {
+			mon.boosts[key] = Math.max(-6, Math.min(6, mon.boosts[key] + effective));
+		}
+	}
+}
+
+/**
+ * Clone a MonState with updated isActive flag.
+ */
+function cloneMonState(mon: MonState, isActive: boolean): MonState {
+	return {
+		...mon,
+		isActive,
+		moves: mon.moves.map(m => ({ ...m })),
+		types: [...mon.types],
+		volatiles: [...mon.volatiles],
+		boosts: { ...mon.boosts },
+		baseStats: { ...mon.baseStats },
+		stats: { ...mon.stats },
+	};
+}
+
+/**
+ * Find the switch target MonState from a side array.
+ */
+function findSwitchTarget(side: MonState[], choice: Choice): MonState | null {
+	return side.find(m =>
+		!m.fainted && !m.isActive && m.position + 1 === choice.switchIndex
+	) ?? null;
+}
+
+/**
+ * Clone a side array, updating the active mon with a new state.
+ */
+function cloneSide(side: MonState[], newActive: MonState): MonState[] {
+	return side.map(m => {
+		if (m.position === newActive.position) {
+			return cloneMonState(newActive, newActive.isActive);
+		}
+		return cloneMonState(m, m.isActive);
+	});
+}
+
+/**
+ * Update a side for a switch: old active becomes inactive, switch-in becomes active.
+ */
+function updateSideForSwitch(side: MonState[], oldActive: MonState, switchIn: MonState): MonState[] {
+	return side.map(m => {
+		if (m.position === oldActive.position) {
+			const cloned = cloneMonState(m, false);
+			cloned.isActive = false;
+			return cloned;
+		}
+		if (m.position === switchIn.position) {
+			return cloneMonState(m, true);
+		}
+		return cloneMonState(m, m.isActive);
+	});
+}
+
+/**
+ * Update a specific mon's HP in a side array (after damage to switch-in).
+ */
+function updateSideMonHP(side: MonState[], mon: MonState): void {
+	for (let i = 0; i < side.length; i++) {
+		if (side[i].position === mon.position) {
+			side[i].hp = mon.hp;
+			side[i].fainted = mon.fainted;
+			break;
+		}
+	}
+}
+
 /**
  * Evaluate MOVE vs MOVE cell analytically.
  *
@@ -372,20 +1183,32 @@ function evaluateAnalyticalMoveMove(
 	let p1ExpDmg = p1Dmg.expectedWithAccuracy;
 	let p2ExpDmg = p2Dmg.expectedWithAccuracy;
 
+	// Focus Sash / Sturdy: cap damage to leave 1 HP if defender is at full HP
+	// These prevent OHKOs but only work once (at full HP, not already broken)
+	const p2HasSash = (p2Active.itemId === 'focussash' || p2Active.abilityId === 'sturdy') && p2Active.hp === p2Active.maxhp;
+	const p1HasSash = (p1Active.itemId === 'focussash' || p1Active.abilityId === 'sturdy') && p1Active.hp === p1Active.maxhp;
+
 	// ─── Move-order adjustments ───────────────────────────────
 
 	if (speedResult.faster === 'p1') {
 		// P1 moves first
 
-		// If P1 OHKOs P2, P2 doesn't get to act
+		// If P1 OHKOs P2, P2 doesn't get to act (unless Focus Sash/Sturdy)
 		if (p1ExpDmg >= p2Active.hp) {
-			// P2 is KO'd before acting → massive advantage for P1
-			const p2HPAfter = 0;
-			return computeHPDeltaEval(
-				p1Active.hp, p1Active.maxhp,
-				p2HPAfter, p2Active.maxhp,
-				baseEval,
-			);
+			if (p2HasSash && p1Move.category !== 'Status') {
+				// Sash activates: P2 survives at 1 HP, then gets to act
+				p1ExpDmg = p2Active.hp - 1;
+				// P2 then gets to attack
+				// (fall through to normal HP computation below)
+			} else {
+				// P2 is KO'd before acting → massive advantage for P1
+				const p2HPAfter = 0;
+				return computeHPDeltaEval(
+					p1Active.hp, p1Active.maxhp,
+					p2HPAfter, p2Active.maxhp,
+					baseEval,
+				);
+			}
 		}
 
 		// If P1 uses a status move that degrades P2's damage
@@ -393,24 +1216,91 @@ function evaluateAnalyticalMoveMove(
 	} else if (speedResult.faster === 'p2') {
 		// P2 moves first
 
-		// If P2 OHKOs P1, P1 doesn't get to act
+		// If P2 OHKOs P1, P1 doesn't get to act (unless Focus Sash/Sturdy)
 		if (p2ExpDmg >= p1Active.hp) {
-			const p1HPAfter = 0;
-			return computeHPDeltaEval(
-				p1HPAfter, p1Active.maxhp,
-				p2Active.hp, p2Active.maxhp,
-				baseEval,
-			);
+			if (p1HasSash && p2Move.category !== 'Status') {
+				// Sash activates: P1 survives at 1 HP, then gets to act
+				p2ExpDmg = p1Active.hp - 1;
+				// P1 then gets to attack
+			} else {
+				const p1HPAfter = 0;
+				return computeHPDeltaEval(
+					p1HPAfter, p1Active.maxhp,
+					p2Active.hp, p2Active.maxhp,
+					baseEval,
+				);
+			}
 		}
 
 		// If P2 uses a status move that degrades P1's damage
 		p1ExpDmg = applyPreMoveStatusEffect(p2Move, p2Active, p1Active, p1Move, p1ExpDmg);
 	}
 	// If tie: both move at "same time" → no adjustment (average case)
+	// (Focus Sash in speed tie: both could theoretically sash, but we apply caps after)
+
+	// Apply Focus Sash caps for speed-tie case and post-status-adjustment
+	if (p2HasSash && p1ExpDmg >= p2Active.hp && p1Move.category !== 'Status') {
+		p1ExpDmg = p2Active.hp - 1;
+	}
+	if (p1HasSash && p2ExpDmg >= p1Active.hp && p2Move.category !== 'Status') {
+		p2ExpDmg = p1Active.hp - 1;
+	}
 
 	// Compute resulting HP
-	const p1HPAfter = Math.max(0, p1Active.hp - p2ExpDmg);
-	const p2HPAfter = Math.max(0, p2Active.hp - p1ExpDmg);
+	let p1HPAfter = Math.max(0, p1Active.hp - p2ExpDmg);
+	let p2HPAfter = Math.max(0, p2Active.hp - p1ExpDmg);
+
+	// ─── Healing move recovery ──────────────────────────────
+	if (p1HPAfter > 0 && p1Move.heal) {
+		const healAmount = Math.floor(p1Active.maxhp * p1Move.heal[0] / p1Move.heal[1]);
+		p1HPAfter = Math.min(p1Active.maxhp, p1HPAfter + healAmount);
+	}
+	if (p2HPAfter > 0 && p2Move.heal) {
+		const healAmount = Math.floor(p2Active.maxhp * p2Move.heal[0] / p2Move.heal[1]);
+		p2HPAfter = Math.min(p2Active.maxhp, p2HPAfter + healAmount);
+	}
+
+	// ─── Drain move recovery ────────────────────────────────
+	if (p1HPAfter > 0 && p1Move.drain && p1ExpDmg > 0) {
+		const drainHeal = Math.floor(Math.min(p1ExpDmg, p2Active.hp) * p1Move.drain[0] / p1Move.drain[1]);
+		p1HPAfter = Math.min(p1Active.maxhp, p1HPAfter + drainHeal);
+	}
+	if (p2HPAfter > 0 && p2Move.drain && p2ExpDmg > 0) {
+		const drainHeal = Math.floor(Math.min(p2ExpDmg, p1Active.hp) * p2Move.drain[0] / p2Move.drain[1]);
+		p2HPAfter = Math.min(p2Active.maxhp, p2HPAfter + drainHeal);
+	}
+
+	// ─── Recoil damage ──────────────────────────────────────
+	if (p1HPAfter > 0 && p1Move.recoil && p1ExpDmg > 0) {
+		const recoilDmg = Math.floor(Math.min(p1ExpDmg, p2Active.hp) * p1Move.recoil[0] / p1Move.recoil[1]);
+		p1HPAfter = Math.max(0, p1HPAfter - recoilDmg);
+	}
+	if (p2HPAfter > 0 && p2Move.recoil && p2ExpDmg > 0) {
+		const recoilDmg = Math.floor(Math.min(p2ExpDmg, p1Active.hp) * p2Move.recoil[0] / p2Move.recoil[1]);
+		p2HPAfter = Math.max(0, p2HPAfter - recoilDmg);
+	}
+
+	// ─── End-of-turn residual effects ────────────────────────
+
+	// Leftovers / Black Sludge: heal 1/16 per turn (if alive)
+	if (p1HPAfter > 0 && (p1Active.itemId === 'leftovers' ||
+		(p1Active.itemId === 'blacksludge' && p1Active.types.includes('Poison')))) {
+		p1HPAfter = Math.min(p1Active.maxhp, p1HPAfter + Math.floor(p1Active.maxhp / 16));
+	}
+	if (p2HPAfter > 0 && (p2Active.itemId === 'leftovers' ||
+		(p2Active.itemId === 'blacksludge' && p2Active.types.includes('Poison')))) {
+		p2HPAfter = Math.min(p2Active.maxhp, p2HPAfter + Math.floor(p2Active.maxhp / 16));
+	}
+
+	// Rocky Helmet: 1/6 HP damage to attacker on contact (if defender alive)
+	if (p2HPAfter > 0 && p2Active.itemId === 'rockyhelmet' &&
+		p1Move.category !== 'Status' && p1Move.flags?.['contact']) {
+		p1HPAfter = Math.max(0, p1HPAfter - Math.floor(p1Active.maxhp / 6));
+	}
+	if (p1HPAfter > 0 && p1Active.itemId === 'rockyhelmet' &&
+		p2Move.category !== 'Status' && p2Move.flags?.['contact']) {
+		p2HPAfter = Math.max(0, p2HPAfter - Math.floor(p2Active.maxhp / 6));
+	}
 
 	return computeHPDeltaEval(p1HPAfter, p1Active.maxhp, p2HPAfter, p2Active.maxhp, baseEval);
 }

@@ -147,9 +147,44 @@ export function getSpeedComparison(
 		p2Pri += 1;
 	}
 
-	if (p1Pri !== p2Pri) {
+	// Prankster: +1 priority for Status moves (Dark types are immune, handled elsewhere)
+	if (p1.abilityId === 'prankster' && p1Move?.category === 'Status') {
+		p1Pri += 1;
+	}
+	if (p2.abilityId === 'prankster' && p2Move?.category === 'Status') {
+		p2Pri += 1;
+	}
+
+	// Triage: +3 priority for healing moves (moves with flags.heal)
+	if (p1.abilityId === 'triage' && p1Move?.flags?.['heal']) {
+		p1Pri += 3;
+	}
+	if (p2.abilityId === 'triage' && p2Move?.flags?.['heal']) {
+		p2Pri += 3;
+	}
+
+	// Mycelium Might: Status moves go last in their priority bracket (-0.1 fractional)
+	// We approximate as -1 priority since we use integers (makes Status slower than same-bracket)
+	// Note: In the sim this is -0.1 fractional; for our analytical calc, treating as
+	// "loses speed tie" is close enough. We subtract 0.5 to lose within same integer bracket.
+	// Actually, to properly model it: if both have priority 0 but one has Mycelium Might
+	// on a Status move, that one goes last. We handle this via a small subtraction.
+	let p1FracPri = 0;
+	let p2FracPri = 0;
+	if (p1.abilityId === 'myceliummight' && p1Move?.category === 'Status') {
+		p1FracPri -= 0.1;
+	}
+	if (p2.abilityId === 'myceliummight' && p2Move?.category === 'Status') {
+		p2FracPri -= 0.1;
+	}
+
+	// Compare using effective priority (integer + fractional)
+	const p1EffPri = p1Pri + p1FracPri;
+	const p2EffPri = p2Pri + p2FracPri;
+
+	if (p1EffPri !== p2EffPri) {
 		return {
-			faster: p1Pri > p2Pri ? 'p1' : 'p2',
+			faster: p1EffPri > p2EffPri ? 'p1' : 'p2',
 			p1Speed: getEffectiveSpeed(p1, field),
 			p2Speed: getEffectiveSpeed(p2, field),
 			p1Priority: p1Pri,
@@ -491,10 +526,16 @@ export function calcDamageWithCrit(
 		return calcDamage(attacker, defender, move, options);
 	}
 
-	const critStage = Math.min(4, Math.max(0, (move.critRatio || 1) - 1));
+	let critStage = Math.min(4, Math.max(0, (move.critRatio || 1) - 1));
 	// critRatio in MoveInfo: 1 = normal (stage 0), 2 = high crit (stage 1), etc.
 	// But PS stores critRatio as the raw value. For most moves, critRatio is 1 (stage 0).
 	// High-crit moves have critRatio: 2. We need to map to the crit stage index.
+
+	// Scope Lens / Razor Claw: +1 crit stage
+	if (attacker.itemId === 'scopelens' || attacker.itemId === 'razorclaw') {
+		critStage = Math.min(4, critStage + 1);
+	}
+
 	const critRate = 1 / CRIT_MULT[critStage];
 
 	const normalResult = calcDamage(attacker, defender, move, { ...options, isCrit: false });
@@ -747,6 +788,47 @@ function getFinalModifier4096(
 
 	// Expert Belt: 1.2x on SE moves
 	if (attacker.itemId === 'expertbelt' && typeMod > 0) {
+		mod = chainMod(mod, 4915, 4096);
+	}
+
+	// Type-boosting items: 1.2x for matching move type
+	const typeBoostItems: Record<string, string> = {
+		magnet: 'Electric', silkscarf: 'Normal', silverpowder: 'Bug',
+		mysticwater: 'Water', charcoal: 'Fire', miracleseed: 'Grass',
+		nevermeltice: 'Ice', blackbelt: 'Fighting', poisonbarb: 'Poison',
+		softsand: 'Ground', sharpbeak: 'Flying', twistedspoon: 'Psychic',
+		spelltag: 'Ghost', dragonfang: 'Dragon', blackglasses: 'Dark',
+		metalcoat: 'Steel', fairyfeather: 'Fairy',
+	};
+	if (typeBoostItems[attacker.itemId] === move.type) {
+		mod = chainMod(mod, 4915, 4096);
+	}
+
+	// Soul Dew: 1.2x Psychic/Dragon for Latias/Latios (Gen 7+)
+	if (attacker.itemId === 'souldew' &&
+		(attacker.speciesId === 'latias' || attacker.speciesId === 'latios') &&
+		(move.type === 'Psychic' || move.type === 'Dragon')) {
+		mod = chainMod(mod, 4915, 4096);
+	}
+
+	// Lustrous Orb: 1.2x Water/Dragon for Palkia
+	if (attacker.itemId === 'lustrousorb' &&
+		(attacker.speciesId === 'palkia' || attacker.speciesId === 'palkiaorigin') &&
+		(move.type === 'Water' || move.type === 'Dragon')) {
+		mod = chainMod(mod, 4915, 4096);
+	}
+
+	// Adamant Orb: 1.2x Dragon/Steel for Dialga
+	if (attacker.itemId === 'adamantorb' &&
+		(attacker.speciesId === 'dialga' || attacker.speciesId === 'dialgaorigin') &&
+		(move.type === 'Dragon' || move.type === 'Steel')) {
+		mod = chainMod(mod, 4915, 4096);
+	}
+
+	// Griseous Orb/Core: 1.2x Dragon/Ghost for Giratina
+	if ((attacker.itemId === 'griseousorb' || attacker.itemId === 'griseouscore') &&
+		(attacker.speciesId === 'giratina' || attacker.speciesId === 'giratinaorigin') &&
+		(move.type === 'Dragon' || move.type === 'Ghost')) {
 		mod = chainMod(mod, 4915, 4096);
 	}
 
@@ -1254,6 +1336,11 @@ function applyItemAttackMod(attack: number, attacker: MonState, isPhysical: bool
 	// Choice Specs: 1.5x SpA
 	if (attacker.itemId === 'choicespecs' && !isPhysical) {
 		attack = modify(attack, 1.5);
+	}
+
+	// Light Ball: 2x Atk AND SpA for Pikachu
+	if (attacker.itemId === 'lightball' && attacker.speciesId === 'pikachu') {
+		attack = modify(attack, 2);
 	}
 
 	return attack;

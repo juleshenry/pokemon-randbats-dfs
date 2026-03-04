@@ -86,6 +86,14 @@ export interface MoveInfo {
 	multihit: number | number[] | null;
 	target: string;
 	overrideOffensiveStat?: string;    // e.g., 'def' for Body Press
+	/** Self-boost for Status setup moves: e.g., Calm Mind → { spa: 1, spd: 1 } */
+	boosts?: Partial<BoostTable>;
+	/** Self-boost side effect on attacking moves: e.g., Close Combat → { def: -1, spd: -1 } */
+	selfBoost?: Partial<BoostTable>;
+	/** Whether move causes user to switch out (U-turn, Volt Switch, etc.) */
+	selfSwitch?: boolean | string;
+	/** Whether move heals: [numerator, denominator], e.g., Recover = [1, 2] */
+	forceSwitch?: boolean;
 }
 
 // ─── Monster State ───────────────────────────────────────────────
