@@ -1,0 +1,30 @@
+{
+  "name": "pokemon-dfs",
+  "version": "0.1.0",
+  "description": "Gen 9 Random Battles minimax/Nash equilibrium DFS bot",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "mocha --require ts-node/register 'test/**/*.test.ts' --timeout 30000",
+    "test:damage": "mocha --require ts-node/register 'test/damage-calc.test.ts' --timeout 30000",
+    "test:nash": "mocha --require ts-node/register 'test/nash.test.ts' --timeout 30000",
+    "test:predictor": "mocha --require ts-node/register 'test/team-predictor.test.ts' --timeout 30000",
+    "test:matchups": "mocha --require ts-node/register 'test/matchups/**/*.test.ts' --timeout 60000"
+  },
+  "dependencies": {
+    "javascript-lp-solver": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.0",
+    "@types/node": "^22.0.0",
+    "chai": "^6.2.2",
+    "mocha": "^11.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
